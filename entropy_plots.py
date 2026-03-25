@@ -144,6 +144,8 @@ def plot_three_heatmaps(results, output_dir):
 
     path = os.path.join(output_dir, "three_heatmaps.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "three_heatmaps.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -199,6 +201,8 @@ def plot_layer_profiles(results, output_dir):
     plt.tight_layout()
     path = os.path.join(output_dir, "layer_profiles.png")
     plt.savefig(path, dpi=200)
+    path_pdf = os.path.join(output_dir, "layer_profiles.pdf")
+    plt.savefig(path_pdf)
     plt.close()
     print(f"Saved: {path}")
 
@@ -266,6 +270,8 @@ def plot_raw_entropy_by_layer(results, output_dir):
     plt.tight_layout()
     path = os.path.join(output_dir, "raw_entropy_by_layer.png")
     plt.savefig(path, dpi=200)
+    path_pdf = os.path.join(output_dir, "raw_entropy_by_layer.pdf")
+    plt.savefig(path_pdf)
     plt.close()
     print(f"Saved: {path}")
 
@@ -353,6 +359,8 @@ def plot_entropy_scatter(results, output_dir):
 
     path = os.path.join(output_dir, "entropy_scatter.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "entropy_scatter.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -471,6 +479,8 @@ def plot_triangulation(results, output_dir):
 
     path = os.path.join(output_dir, "triangulation.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "triangulation.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -531,6 +541,8 @@ def plot_top_heads_comparison(results, output_dir, top_n=15):
     plt.tight_layout()
     path = os.path.join(output_dir, "top_heads_comparison.png")
     plt.savefig(path, dpi=200)
+    path_pdf = os.path.join(output_dir, "top_heads_comparison.pdf")
+    plt.savefig(path_pdf)
     plt.close()
     print(f"Saved: {path}")
 

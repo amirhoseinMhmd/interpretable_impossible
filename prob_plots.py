@@ -141,6 +141,8 @@ def plot_probing_heatmaps(results, output_dir):
 
         path = os.path.join(output_dir, f"probing_heatmap_{prop}.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
+        path_pdf = os.path.join(output_dir, f"probing_heatmap_{prop}.pdf")
+        plt.savefig(path_pdf, bbox_inches="tight")
         plt.close()
         print(f"Saved: {path}")
 
@@ -215,6 +217,8 @@ def plot_layer_profiles(results, output_dir):
     plt.tight_layout()
     path = os.path.join(output_dir, "probing_layer_profiles.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "probing_layer_profiles.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -280,6 +284,8 @@ def plot_divergence_heatmaps(results, output_dir):
 
     path = os.path.join(output_dir, "probing_divergence_heatmaps.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "probing_divergence_heatmaps.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -338,6 +344,8 @@ def plot_top_divergent_heads(results, output_dir, top_n=10):
     plt.tight_layout()
     path = os.path.join(output_dir, "probing_top_heads.png")
     plt.savefig(path, dpi=200)
+    path_pdf = os.path.join(output_dir, "probing_top_heads.pdf")
+    plt.savefig(path_pdf)
     plt.close()
     print(f"Saved: {path}")
 
@@ -425,6 +433,8 @@ def plot_baseline_comparison(results, output_dir):
     plt.tight_layout()
     path = os.path.join(output_dir, "probing_baselines.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "probing_baselines.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -529,6 +539,8 @@ def plot_entropy_probing_correlation(results, entropy_results_path, output_dir):
 
     path = os.path.join(output_dir, "entropy_probing_correlation.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
+    path_pdf = os.path.join(output_dir, "entropy_probing_correlation.pdf")
+    plt.savefig(path_pdf, bbox_inches="tight")
     plt.close()
     print(f"Saved: {path}")
 
@@ -577,6 +589,8 @@ def plot_divergence_layer_profile(results, output_dir):
     plt.tight_layout()
     path = os.path.join(output_dir, "probing_divergence_layer_profile.png")
     plt.savefig(path, dpi=200)
+    path_pdf = os.path.join(output_dir, "probing_divergence_layer_profile.pdf")
+    plt.savefig(path_pdf)
     plt.close()
     print(f"Saved: {path}")
 

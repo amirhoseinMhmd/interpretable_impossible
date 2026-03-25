@@ -1,18 +1,15 @@
-import torch
-import numpy as np
-import json
 import argparse
-from pathlib import Path
-from collections import defaultdict
+import json
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import numpy as np
+import spacy
+import torch
+from scipy import stats
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from scipy import stats
-
-import spacy
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
