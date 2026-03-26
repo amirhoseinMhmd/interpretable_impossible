@@ -5,10 +5,20 @@ import matplotlib.colors as mcolors
 import argparse
 import os
 
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif']
+plt.rcParams['mathtext.fontset'] = 'dejavuserif'
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.labelsize'] = 11
+plt.rcParams['axes.titlesize'] = 12
+plt.rcParams['xtick.labelsize'] = 9
+plt.rcParams['ytick.labelsize'] = 9
+plt.rcParams['legend.fontsize'] = 9
+plt.rcParams['figure.titlesize'] = 14
+plt.rcParams['axes.linewidth'] = 1.2
+plt.rcParams['grid.linewidth'] = 0.8
+plt.rcParams['lines.linewidth'] = 2.0
 
-# ─────────────────────────────────────────────────────────────
-# Consistent naming across all plots
-# ─────────────────────────────────────────────────────────────
 MODEL_NAMES = {
     "translation": "Translator (shuffled → English)",
     "impossible": "Impossible LM (Kallini et al.)",
