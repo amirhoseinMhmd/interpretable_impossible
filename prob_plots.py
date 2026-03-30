@@ -627,6 +627,143 @@ def plot_divergence_layer_profile(results, output_dir):
 
 
 # ─────────────────────────────────────────────────────────────
+# 7b. Three-way divergence layer profiles (token-level)
+# ─────────────────────────────────────────────────────────────
+DIVERGENCE_PAIR_LABELS = {
+    "divergence": "Translator vs Impossible",
+    "divergence_vs_base": "Translator vs GPT-2 Base",
+    "divergence_base_vs_impossible": "GPT-2 Base vs Impossible",
+}
+
+DIVERGENCE_PAIR_COLORS = {
+    "divergence": "#A32D2D",
+    "divergence_vs_base": "#534AB7",
+    "divergence_base_vs_impossible": "#1D9E75",
+}
+
+DIVERGENCE_PAIR_MARKERS = {
+    "divergence": "o",
+    "divergence_vs_base": "s",
+    "divergence_base_vs_impossible": "D",
+}
+
+DIVERGENCE_PAIR_STYLES = {
+    "divergence": "-",
+    "divergence_vs_base": "--",
+    "divergence_base_vs_impossible": ":",
+}
+
+
+def plot_threeway_divergence_layer_profile(results, output_dir):
+    """Three-way model comparison: mean probing divergence per layer.
+
+    Shows whether translator recovers to baseline or exceeds it.
+    """
+    div_keys = [k for k in ["divergence", "divergence_vs_base",
+                             "divergence_base_vs_impossible"]
+                if k in results]
+    if len(div_keys) < 2:
+        print("Need at least 2 divergence sets for three-way plot, skipping.")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+
+    for ax, prop in zip(axes, ["pos", "dep_rel", "depth"]):
+        _, metric_label = PROPERTY_METRICS[prop]
+
+        for dk in div_keys:
+            if prop not in results[dk]:
+                continue
+            delta = np.array(results[dk][prop])
+            n_layers = delta.shape[0]
+            layer_means = [np.mean(delta[l, :]) for l in range(n_layers)]
+
+            ax.plot(
+                range(n_layers), layer_means,
+                marker=DIVERGENCE_PAIR_MARKERS[dk],
+                linestyle=DIVERGENCE_PAIR_STYLES[dk],
+                linewidth=2.5,
+                label=DIVERGENCE_PAIR_LABELS[dk],
+                color=DIVERGENCE_PAIR_COLORS[dk],
+                markersize=8,
+            )
+
+        ax.axhline(y=0, color="black", linewidth=0.8, linestyle="--", alpha=0.4)
+        ax.set_xlabel("Transformer Layer", fontsize=12)
+        ax.set_ylabel(f"Mean Δ{metric_label}", fontsize=12)
+        ax.set_title(PROPERTY_LABELS[prop], fontsize=13, fontweight="bold")
+        ax.set_xticks(range(n_layers))
+        ax.set_xticklabels([f"{i}" for i in range(n_layers)], fontsize=9)
+        ax.legend(fontsize=8, loc="best", framealpha=0.9)
+        ax.grid(alpha=0.15)
+
+    fig.suptitle(
+        "Three-Way Probing Divergence: Does Translation Recover or Exceed Baseline?\n"
+        "Translator vs Base near 0 = recovery  |  Positive = novel syntactic encoding",
+        fontsize=14, fontweight="bold", y=1.02, linespacing=1.5,
+    )
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        path = os.path.join(output_dir, f"threeway_divergence_layer_profile.{ext}")
+        plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: threeway_divergence_layer_profile.png")
+
+
+def plot_threeway_pairwise_divergence_layer_profile(results, output_dir):
+    """Three-way comparison for pairwise probing divergence."""
+    div_keys = [k for k in ["divergence", "divergence_vs_base",
+                             "divergence_base_vs_impossible"]
+                if k in results]
+    if len(div_keys) < 2:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    for ax, task in zip(axes, ["arc", "relation"]):
+        div_data_key = PAIRWISE_DIVERGENCE_KEYS[task]
+        _, metric_label = PAIRWISE_METRICS[task]
+
+        for dk in div_keys:
+            if div_data_key not in results[dk]:
+                continue
+            delta = np.array(results[dk][div_data_key])
+            n_layers = delta.shape[0]
+            layer_means = [np.mean(delta[l, :]) for l in range(n_layers)]
+
+            ax.plot(
+                range(n_layers), layer_means,
+                marker=DIVERGENCE_PAIR_MARKERS[dk],
+                linestyle=DIVERGENCE_PAIR_STYLES[dk],
+                linewidth=2.5,
+                label=DIVERGENCE_PAIR_LABELS[dk],
+                color=DIVERGENCE_PAIR_COLORS[dk],
+                markersize=8,
+            )
+
+        ax.axhline(y=0, color="black", linewidth=0.8, linestyle="--", alpha=0.4)
+        ax.set_xlabel("Transformer Layer", fontsize=12)
+        ax.set_ylabel(f"Mean Δ{metric_label}", fontsize=12)
+        ax.set_title(PAIRWISE_LABELS[task], fontsize=13, fontweight="bold")
+        ax.set_xticks(range(n_layers))
+        ax.set_xticklabels([f"{i}" for i in range(n_layers)], fontsize=9)
+        ax.legend(fontsize=8, loc="best", framealpha=0.9)
+        ax.grid(alpha=0.15)
+
+    fig.suptitle(
+        "Three-Way Pairwise Probing Divergence\n"
+        "Does translation recover relational structure or create novel encoding?",
+        fontsize=14, fontweight="bold", y=1.02, linespacing=1.5,
+    )
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        path = os.path.join(output_dir, f"threeway_pairwise_divergence_layer_profile.{ext}")
+        plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: threeway_pairwise_divergence_layer_profile.png")
+
+
+# ─────────────────────────────────────────────────────────────
 # 8. Pairwise: heatmaps (Translator vs Impossible per task)
 # ─────────────────────────────────────────────────────────────
 def plot_pairwise_heatmaps(results, output_dir):
@@ -895,21 +1032,15 @@ def plot_pairwise_baseline_comparison(results, output_dir):
         metric_key, metric_label = PAIRWISE_METRICS[task]
         categories, values, colors = [], [], []
 
-        # Translator head mean
-        pw_summ_t = results["translator"].get("layer_summary_pairwise", {})
-        if task in pw_summ_t:
-            mean_t = np.mean(pw_summ_t[task])
-            categories.append("Translator\n(head mean)")
-            values.append(mean_t)
-            colors.append(MODEL_COLORS["translator"])
-
-        # Impossible head mean
-        pw_summ_i = results["impossible"].get("layer_summary_pairwise", {})
-        if task in pw_summ_i:
-            mean_i = np.mean(pw_summ_i[task])
-            categories.append("Impossible\n(head mean)")
-            values.append(mean_i)
-            colors.append(MODEL_COLORS["impossible"])
+        # Head means for each model
+        model_keys = [k for k in ["translator", "impossible", "base"] if k in results]
+        short_names = {"translator": "Translator", "impossible": "Impossible", "base": "GPT-2 Base"}
+        for mk in model_keys:
+            pw_summ = results[mk].get("layer_summary_pairwise", {})
+            if task in pw_summ:
+                categories.append(f"{short_names[mk]}\n(head mean)")
+                values.append(np.mean(pw_summ[task]))
+                colors.append(MODEL_COLORS[mk])
 
         # Pairwise baselines (from translator — baselines are model-independent input)
         pw_bl = results["translator"].get("pairwise_baselines", {})
@@ -1254,6 +1385,11 @@ if __name__ == "__main__":
     plot_divergence_layer_profile(results, args.output_dir)
     plot_entropy_probing_correlation(results, args.entropy_results, args.output_dir)
 
+    # Three-way divergence (if base model data available)
+    if "divergence_vs_base" in results:
+        print("\nGenerating three-way divergence plots...")
+        plot_threeway_divergence_layer_profile(results, args.output_dir)
+
     # Pairwise probing plots (if available)
     if _has_pairwise(results):
         print("\nGenerating pairwise probing plots...")
@@ -1264,6 +1400,8 @@ if __name__ == "__main__":
         plot_pairwise_baseline_comparison(results, args.output_dir)
         plot_pairwise_top_divergent_heads(results, args.output_dir)
         plot_pairwise_entropy_correlation(results, args.entropy_results, args.output_dir)
+        if "divergence_vs_base" in results:
+            plot_threeway_pairwise_divergence_layer_profile(results, args.output_dir)
     else:
         print("\nNo pairwise probing data found, skipping pairwise plots.")
 
