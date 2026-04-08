@@ -78,8 +78,9 @@ class InterventionConfig:
     probing_results: Optional[str] = None
     num_sentences: int = 200
     max_new_tokens: int = 64
-    batch_size: int = 8
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_size: int = 32
+    device: str = "cuda" if torch.cuda.is_available() else "mps"
+    fp16: bool = False
     seed: int = 0
     em_threshold: float = 0.05
     f1_threshold: float = 0.10
@@ -259,9 +260,9 @@ class InterventionModel:
 
     # ---- statistics estimation ----------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def estimate_activation_statistics(
-        self, texts: Sequence[str], max_length: int = 128
+        self, texts: Sequence[str], max_length: int = 128, batch_size: int = 16
     ) -> None:
         """Run a forward pass over `texts` and record per-layer mean/std.
 
@@ -310,17 +311,21 @@ class InterventionModel:
         self._attn_interventions = {}
         self._ffn_interventions  = {}
 
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        formatted = [self._format_prompt(t) for t in texts if t and t.strip()]
         try:
-            for text in texts:
-                if not text or not text.strip():
-                    continue
-                # Use the same prompt format as generation.
-                formatted = self._format_prompt(text)
+            for start in range(0, len(formatted), batch_size):
+                batch = formatted[start:start + batch_size]
                 enc = self.tokenizer(
-                    formatted,
+                    batch,
                     return_tensors="pt",
                     truncation=True,
                     max_length=max_length,
+                    padding=True,
                 ).to(self.device)
                 if enc["input_ids"].numel() == 0:
                     continue
@@ -330,6 +335,7 @@ class InterventionModel:
                 h.remove()
             self._attn_interventions = saved_attn
             self._ffn_interventions  = saved_ffn
+            self.tokenizer.padding_side = original_padding_side
 
         for i in range(self.n_layers):
             n = max(counts[i], 1)
@@ -356,37 +362,62 @@ class InterventionModel:
 
     # ---- generation ---------------------------------------------------
 
-    @torch.no_grad()
-    def generate(self, prompts: Sequence[str], max_new_tokens: int = 64) -> List[str]:
-        outputs: List[str] = []
-        for prompt in prompts:
-            if not prompt or not prompt.strip():
-                outputs.append("")
-                continue
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompts: Sequence[str],
+        max_new_tokens: int = 64,
+        batch_size: int = 16,
+    ) -> List[str]:
+        """Batched greedy generation. Uses left-padding so that every prompt in
+        the batch ends at the same position, which lets us slice the new tokens
+        in one go."""
+        # Left-padding is required for correct causal-LM generation with padding.
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            formatted = self._format_prompt(prompt)
-            enc = self.tokenizer(
-                formatted,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            ).to(self.device)
+        outputs: List[str] = [""] * len(prompts)
+        # Separate the non-empty prompts so we don't feed empty strings to the model.
+        valid_indices: List[int] = []
+        formatted_prompts: List[str] = []
+        for i, prompt in enumerate(prompts):
+            if prompt and prompt.strip():
+                valid_indices.append(i)
+                formatted_prompts.append(self._format_prompt(prompt))
 
-            if enc["input_ids"].numel() == 0:
-                outputs.append("")
-                continue
-
-            gen = self.model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-            new_tokens = gen[0, enc["input_ids"].shape[1]:]
-            text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            outputs.append(text.strip())
+        try:
+            for start in range(0, len(formatted_prompts), batch_size):
+                batch_prompts = formatted_prompts[start:start + batch_size]
+                batch_idx = valid_indices[start:start + batch_size]
+                enc = self.tokenizer(
+                    batch_prompts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding=True,
+                ).to(self.device)
+                if enc["input_ids"].numel() == 0:
+                    continue
+                gen = self.model.generate(
+                    **enc,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+                input_len = enc["input_ids"].shape[1]
+                new_tokens = gen[:, input_len:]
+                texts = self.tokenizer.batch_decode(
+                    new_tokens, skip_special_tokens=True
+                )
+                for dst, text in zip(batch_idx, texts):
+                    outputs[dst] = text.strip()
+        finally:
+            self.tokenizer.padding_side = original_padding_side
         return outputs
 
 
@@ -555,8 +586,13 @@ def evaluate(
     pairs: Sequence[Tuple[str, str]],
     dep_eval: DependencyEvaluator,
     max_new_tokens: int,
+    batch_size: int = 16,
 ) -> EvaluationResult:
-    preds = wrapper.generate([p[0] for p in pairs], max_new_tokens=max_new_tokens)
+    preds = wrapper.generate(
+        [p[0] for p in pairs],
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+    )
     em_vals, tok_vals = [], []
     bleu_vals = {f"bleu{n}": [] for n in range(1, 5)}
     dep_vals  = {"dep_f1": [], "uas": [], "las": []}
@@ -604,7 +640,9 @@ def bootstrap_ci(
 # ---------------------------------------------------------------------------
 
 
-def load_model(path: str, device: str) -> Tuple[GPT2LMHeadModel, AutoTokenizer]:
+def load_model(
+    path: str, device: str, dtype: torch.dtype = torch.float32
+) -> Tuple[GPT2LMHeadModel, AutoTokenizer]:
     """Load a GPT-2 model. Local fine-tuned checkpoints in this project ship
     without tokenizer files, so we always fall back to the standard ``gpt2``
     tokenizer (vocab_size=50257) when the local one is empty/broken."""
@@ -616,7 +654,7 @@ def load_model(path: str, device: str) -> Tuple[GPT2LMHeadModel, AutoTokenizer]:
         tok = AutoTokenizer.from_pretrained("gpt2")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = GPT2LMHeadModel.from_pretrained(path)
+    model = GPT2LMHeadModel.from_pretrained(path, torch_dtype=dtype)
     return model, tok
 
 
@@ -635,7 +673,7 @@ def run_single_layer_ablations(
             results[key] = {}
             for layer in range(wrapper.n_layers):
                 wrapper.set_intervention([layer], kind=kind, scope=scope)
-                res = evaluate(wrapper, pairs, dep_eval, cfg.max_new_tokens)
+                res = evaluate(wrapper, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size)
                 delta_em  = baseline.em     - res.em
                 delta_f1  = baseline.dep_f1 - res.dep_f1
                 results[key][str(layer)] = {
@@ -826,6 +864,10 @@ def parse_args() -> InterventionConfig:
     p.add_argument("--output", default="causal_intervention_results.json")
     p.add_argument("--num_sentences", type=int, default=200)
     p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=32,
+                   help="Batch size for generation and statistics estimation.")
+    p.add_argument("--fp16", action="store_true",
+                   help="Load models in float16 (CUDA only) for ~2x speedup.")
     p.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -841,6 +883,8 @@ def parse_args() -> InterventionConfig:
         probing_results=args.probing_results,
         num_sentences=args.num_sentences,
         max_new_tokens=args.max_new_tokens,
+        batch_size=args.batch_size,
+        fp16=args.fp16,
         device=args.device,
         seed=args.seed,
     )
@@ -851,7 +895,16 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    print(f"Device: {cfg.device}")
+    # Speed knobs: enable cuDNN benchmark + TF32 for matmul on Ampere+ GPUs.
+    if cfg.device.startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    dtype = torch.float16 if (cfg.fp16 and cfg.device.startswith("cuda")) else torch.float32
+    print(f"Device: {cfg.device}  dtype: {dtype}  batch_size: {cfg.batch_size}")
     print(f"Loading dataset: {cfg.dataset}")
     pairs = load_dataset(cfg.dataset, cfg.num_sentences)
     print(f"  -> {len(pairs)} sentence pairs")
@@ -860,13 +913,15 @@ def main() -> None:
     # Translator (fine-tuned; uses "Fix this text:" prompt format)
     # ------------------------------------------------------------------
     print(f"\nLoading translator: {cfg.translator_model}")
-    translator_model, tokenizer = load_model(cfg.translator_model, cfg.device)
+    translator_model, tokenizer = load_model(cfg.translator_model, cfg.device, dtype=dtype)
     translator = InterventionModel(
         translator_model, tokenizer, cfg.device, is_translator=True
     )
 
     print("Estimating activation statistics for mean/random interventions ...")
-    translator.estimate_activation_statistics([p[0] for p in pairs[:50]])
+    translator.estimate_activation_statistics(
+        [p[0] for p in pairs[:50]], batch_size=cfg.batch_size
+    )
 
     dep_eval = DependencyEvaluator()
     if dep_eval.nlp is None:
@@ -874,14 +929,16 @@ def main() -> None:
 
     print("\nEvaluating intact translator baseline ...")
     translator.clear()
-    baseline = evaluate(translator, pairs, dep_eval, cfg.max_new_tokens)
+    baseline = evaluate(translator, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size)
     print(
         f"  baseline  EM={baseline.em:.3f}  tokAcc={baseline.token_acc:.3f}  "
         f"BLEU1={baseline.bleu1:.3f}  depF1={baseline.dep_f1:.3f}"
     )
 
     # Sanity-check: show first prediction so prompt format can be verified.
-    sample_pred = translator.generate([pairs[0][0]], max_new_tokens=cfg.max_new_tokens)[0]
+    sample_pred = translator.generate(
+        [pairs[0][0]], max_new_tokens=cfg.max_new_tokens, batch_size=cfg.batch_size
+    )[0]
     print(f"\n  [sanity] src : {pairs[0][0]}")
     print(f"  [sanity] ref : {pairs[0][1]}")
     print(f"  [sanity] pred: {sample_pred}\n")
@@ -912,12 +969,14 @@ def main() -> None:
     # Impossible model baseline (raw scrambled text — no translator prompt)
     # ------------------------------------------------------------------
     print(f"\nLoading impossible model: {cfg.impossible_model}")
-    imp_model, imp_tok = load_model(cfg.impossible_model, cfg.device)
+    imp_model, imp_tok = load_model(cfg.impossible_model, cfg.device, dtype=dtype)
     impossible = InterventionModel(
         imp_model, imp_tok, cfg.device, is_translator=False
     )
     print("Evaluating impossible baseline ...")
-    impossible_baseline = evaluate(impossible, pairs, dep_eval, cfg.max_new_tokens)
+    impossible_baseline = evaluate(
+        impossible, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size
+    )
     print(
         f"  impossible  EM={impossible_baseline.em:.3f}  "
         f"depF1={impossible_baseline.dep_f1:.3f}"
@@ -927,12 +986,14 @@ def main() -> None:
     # Base GPT-2 baseline (raw scrambled text)
     # ------------------------------------------------------------------
     print(f"\nLoading base model: {cfg.base_model}")
-    base_model, base_tok = load_model(cfg.base_model, cfg.device)
+    base_model, base_tok = load_model(cfg.base_model, cfg.device, dtype=dtype)
     base_wrapper = InterventionModel(
         base_model, base_tok, cfg.device, is_translator=False
     )
     print("Evaluating base GPT-2 baseline ...")
-    base_baseline = evaluate(base_wrapper, pairs, dep_eval, cfg.max_new_tokens)
+    base_baseline = evaluate(
+        base_wrapper, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size
+    )
     print(
         f"  base GPT-2  EM={base_baseline.em:.3f}  depF1={base_baseline.dep_f1:.3f}"
     )
