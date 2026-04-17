@@ -205,7 +205,7 @@ def parse_args():
     )
     parser.add_argument(
         "--perturbation_name", type=str, required=True,
-        choices=["LOCALSHUFFLE", "PARTIALREVERSE", "WORDHOP"],
+        choices=["localShuffle", "partialReverse", "wordHop", "FullShuffle"],
     )
     parser.add_argument(
         "--input_type", type=str, default="impossible",
