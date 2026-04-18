@@ -66,7 +66,7 @@ class SyntacticLabeler:
 class HeadRepresentationExtractor:
     """Load a GPT-2 model and extract per-head output representations."""
 
-    def __init__(self, model_path: str, tokenizer_path: str = None, device=None):
+    def __init__(self, model_path: str, tokenizer_path: str = None, device=None, fp16: bool = False):
         if device is None:
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
@@ -82,10 +82,12 @@ class HeadRepresentationExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained(tok_path)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        dtype = torch.float16 if fp16 else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             attn_implementation="eager",
             output_hidden_states=False,
+            torch_dtype=dtype,
         )
         self.model.to(self.device)
         self.model.eval()
@@ -175,7 +177,9 @@ class HeadRepresentationExtractor:
                 )
 
             # Save true per-head outputs before c_proj mixes head subspaces.
-            self._head_outputs[layer_idx] = attn_output.permute(0, 2, 1, 3).detach().cpu()
+            # Keep on GPU until batch is done — no per-layer CPU sync.
+            self._head_outputs[layer_idx] = attn_output.permute(0, 2, 1, 3).detach()
+            # shape: (batch, seq, n_heads, d_head) — stays on GPU until batch is done
 
             attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
             attn_output = attn_module.c_proj(attn_output)
@@ -207,28 +211,73 @@ class HeadRepresentationExtractor:
 
     # -- extraction ---------------------------------------------------------
 
-    def extract(self, text: str):
+    @torch.inference_mode()
+    def extract_batch(self, texts: list[str]) -> list[tuple]:
+        """Tokenize all texts at once and run ONE forward pass for the whole batch.
 
+        Returns a list of (head_reps, token_ids, tokens, offsets) tuples,
+        one per input text, where head_reps is {(layer_idx, head_idx): np.ndarray
+        of shape (seq_len, d_head)}.
+        """
         self._head_outputs.clear()
-        inputs, token_ids, tokens, offsets = self.tokenize(text)
 
-        seq_len = inputs["input_ids"].shape[1]
-        if seq_len == 0:
-            return None, [], [], []
+        encoded = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_offsets_mapping=True,
+        )
 
-        with torch.no_grad():
-            self.model(**inputs)
+        # Extract offset mapping before passing to model
+        offset_mapping_batch = encoded.pop("offset_mapping")  # (batch, seq)
+        attention_mask = encoded["attention_mask"]  # (batch, seq) on CPU still
 
-        head_reps = {}
-        for layer_idx in range(self.n_layers):
-            per_head = self._head_outputs[layer_idx][0]  # (seq, n_heads, d_head)
-            for head_idx in range(self.n_heads):
-                arr = per_head[:, head_idx, :].numpy()
-                # Replace NaN/Inf at source to avoid downstream data loss
-                np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                head_reps[(layer_idx, head_idx)] = arr
+        model_inputs = {k: v.to(self.device) for k, v in encoded.items()}
+        attention_mask_device = model_inputs["attention_mask"]
 
-        return head_reps, token_ids, tokens, offsets
+        self.model(**model_inputs)
+
+        # Bulk CPU transfer — one transfer per layer for the whole batch
+        head_outputs_cpu = {
+            l: self._head_outputs[l].cpu().float().numpy()
+            for l in range(self.n_layers)
+        }
+        self._head_outputs.clear()
+
+        results = []
+        batch_size = len(texts)
+        attention_mask_np = attention_mask.numpy()
+
+        for b_idx in range(batch_size):
+            seq_len = int(attention_mask_np[b_idx].sum())
+            if seq_len == 0:
+                results.append((None, [], [], []))
+                continue
+
+            # Per-sample token ids and tokens (non-padded portion)
+            input_ids_b = model_inputs["input_ids"][b_idx, :seq_len].tolist()
+            tokens_b = self.tokenizer.convert_ids_to_tokens(input_ids_b)
+            offsets_b = [
+                tuple(span)
+                for span in offset_mapping_batch[b_idx, :seq_len].tolist()
+            ]
+
+            head_reps = {}
+            for l in range(self.n_layers):
+                per_head = head_outputs_cpu[l][b_idx, :seq_len, :, :]  # (seq, n_heads, d_head)
+                for h in range(self.n_heads):
+                    arr = per_head[:, h, :]
+                    np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    head_reps[(l, h)] = arr
+
+            results.append((head_reps, input_ids_b, tokens_b, offsets_b))
+
+        return results
+
+    def extract(self, text: str):
+        return self.extract_batch([text])[0]
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +365,7 @@ def build_probing_dataset(
     scrambled_sentences: list[str],
     original_sentences: list[str],
     max_sentences: int = None,
+    batch_size: int = 16,
 ):
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
@@ -331,44 +381,53 @@ def build_probing_dataset(
     }
 
     skipped = 0
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Building probing data: {i}/{len(scrambled_sentences)}", flush=True)
+    total = len(scrambled_sentences)
 
-        # Gold labels from original sentence
-        labels = labeler.extract_labels(original)
+    for batch_start in range(0, total, batch_size):
+        batch_scrambled = scrambled_sentences[batch_start:batch_start + batch_size]
+        batch_original = original_sentences[batch_start:batch_start + batch_size]
 
-        # Model representations from scrambled sentence
-        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
-        if head_reps is None:
-            skipped += 1
-            continue
+        if batch_start % 100 == 0:
+            print(f"  Building probing data: {batch_start}/{total}", flush=True)
 
-        # Align scrambled words back to original labels by identity.
-        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
-        if len(aligned) == 0:
-            skipped += 1
-            continue
+        batch_results = extractor.extract_batch(batch_scrambled)
 
-        # Collect aligned representations and labels
-        for entry in aligned:
-            sw_idx = entry["subword_idx"]
-            for l in range(n_layers):
-                for h in range(n_heads):
-                    rep = head_reps[(l, h)]
-                    if sw_idx < rep.shape[0]:
-                        dataset[(l, h)]["X"].append(rep[sw_idx])
-                        dataset[(l, h)]["pos"].append(entry["pos"])
-                        dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
-                        dataset[(l, h)]["depth"].append(entry["depth"])
-                        dataset[(l, h)]["head_idx"].append(entry["head_idx"])
-                        dataset[(l, h)]["sentence_id"].append(i)
+        for i_local, (scrambled, original, extraction) in enumerate(
+            zip(batch_scrambled, batch_original, batch_results)
+        ):
+            i = batch_start + i_local
+            head_reps, token_ids, tokens, offsets = extraction
+
+            if head_reps is None:
+                skipped += 1
+                continue
+
+            # Gold labels from original sentence
+            labels = labeler.extract_labels(original)
+
+            # Align scrambled words back to original labels by identity.
+            aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+            if len(aligned) == 0:
+                skipped += 1
+                continue
+
+            # Collect aligned representations and labels
+            for entry in aligned:
+                sw_idx = entry["subword_idx"]
+                for l in range(n_layers):
+                    for h in range(n_heads):
+                        rep = head_reps[(l, h)]
+                        if sw_idx < rep.shape[0]:
+                            dataset[(l, h)]["X"].append(rep[sw_idx])
+                            dataset[(l, h)]["pos"].append(entry["pos"])
+                            dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
+                            dataset[(l, h)]["depth"].append(entry["depth"])
+                            dataset[(l, h)]["head_idx"].append(entry["head_idx"])
+                            dataset[(l, h)]["sentence_id"].append(i)
 
     if skipped:
         print(
-            f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (alignment)",
+            f"  Skipped {skipped}/{total} sentences (alignment)",
             flush=True,
         )
 
@@ -504,7 +563,7 @@ class ProbingExperiment:
         # Linear probe
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -521,7 +580,7 @@ class ProbingExperiment:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
@@ -567,7 +626,7 @@ class ProbingExperiment:
 
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -582,7 +641,7 @@ class ProbingExperiment:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
@@ -619,7 +678,7 @@ class ProbingExperiment:
                 X, depths, test_size=self.test_size, random_state=self.random_state,
             )
 
-        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0, solver="auto"))
         reg.fit(X_train, y_train)
         y_pred = reg.predict(X_test)
 
@@ -637,7 +696,7 @@ class ProbingExperiment:
         # Random label baseline
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        reg_rand = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        reg_rand = make_pipeline(StandardScaler(), Ridge(alpha=1.0, solver="auto"))
         reg_rand.fit(X_train, y_shuffled)
         rand_mse = mean_squared_error(y_test, reg_rand.predict(X_test))
 
@@ -763,7 +822,7 @@ class PairwiseDependencyProber:
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
             class_weight={0: weights[0], 1: weights[1]},
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -783,7 +842,7 @@ class PairwiseDependencyProber:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_f1 = f1_score(y_test, clf_rand.predict(X_test), zero_division=0)
 
@@ -852,7 +911,7 @@ class PairwiseDependencyProber:
 
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -868,7 +927,7 @@ class PairwiseDependencyProber:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
+            random_state=self.random_state, n_jobs=-1,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
@@ -897,6 +956,7 @@ def build_pairwise_dataset(
     original_sentences: list[str],
     combination: str = "concat",
     max_sentences: int = None,
+    batch_size: int = 16,
 ):
     """Build pairwise token-pair dataset for dependency structure probing.
 
@@ -915,7 +975,6 @@ def build_pairwise_dataset(
 
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
-    combiner = PairwiseDependencyProber(combination=combination)
 
     # Collect per-sentence pairwise data, then combine per-head
     # To save memory, accumulate X for one (layer, head) at a time is impractical
@@ -924,103 +983,173 @@ def build_pairwise_dataset(
     sentence_data = []  # list of dicts with aligned info and head_reps
 
     skipped = 0
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Building pairwise data: {i}/{len(scrambled_sentences)}", flush=True)
+    total = len(scrambled_sentences)
 
-        labels = labeler.extract_labels(original)
-        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
-        if head_reps is None:
-            skipped += 1
-            continue
+    for batch_start in range(0, total, batch_size):
+        batch_scrambled = scrambled_sentences[batch_start:batch_start + batch_size]
+        batch_original = original_sentences[batch_start:batch_start + batch_size]
 
-        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
-        if len(aligned) < 2:  # need at least 2 tokens for pairs
-            skipped += 1
-            continue
+        if batch_start % 100 == 0:
+            print(f"  Building pairwise data: {batch_start}/{total}", flush=True)
 
-        sentence_data.append({
-            "aligned": aligned,
-            "head_reps": head_reps,
-            "n_aligned": len(aligned),
-            "sentence_id": i,
-        })
+        batch_results = extractor.extract_batch(batch_scrambled)
+
+        for i_local, (scrambled, original, extraction) in enumerate(
+            zip(batch_scrambled, batch_original, batch_results)
+        ):
+            i = batch_start + i_local
+            head_reps, token_ids, tokens, offsets = extraction
+
+            if head_reps is None:
+                skipped += 1
+                continue
+
+            labels = labeler.extract_labels(original)
+            aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+            if len(aligned) < 2:  # need at least 2 tokens for pairs
+                skipped += 1
+                continue
+
+            sentence_data.append({
+                "aligned": aligned,
+                "head_reps": head_reps,
+                "n_aligned": len(aligned),
+                "sentence_id": i,
+            })
 
     if skipped:
         print(
-            f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (pairwise alignment)",
+            f"  Skipped {skipped}/{total} sentences (pairwise alignment)",
             flush=True,
         )
 
-    # Now build per-head pairwise datasets
+    # Now build per-head pairwise datasets using numpy vectorization
+    # Accumulators keyed by (layer, head)
+    accumulators = {
+        (l, h): {
+            "X_pairs": [],
+            "y_arc": [],
+            "X_pairs_pos": [],
+            "y_rel_pos": [],
+            "distances": [],
+            "sentence_ids": [],
+            "sentence_ids_pos": [],
+        }
+        for l in range(n_layers)
+        for h in range(n_heads)
+    }
+
+    for sent in sentence_data:
+        aligned = sent["aligned"]
+        n_tok = sent["n_aligned"]
+
+        # Build all_reps: (n_layers, n_heads, seq, d_head)
+        all_reps = np.stack([
+            np.stack([sent["head_reps"][(l, h)] for h in range(n_heads)])
+            for l in range(n_layers)
+        ])
+
+        sw_indices = np.array([a["subword_idx"] for a in aligned])
+        valid = sw_indices < all_reps.shape[2]
+        sw_indices = sw_indices[valid]
+        aligned_f = [a for a, v in zip(aligned, valid) if v]
+        n_tok_v = len(aligned_f)
+
+        if n_tok_v < 2:
+            continue
+
+        # indexed_reps shape: (n_layers, n_heads, n_tok_v, d_head)
+        indexed_reps = all_reps[:, :, sw_indices, :]
+
+        # Build all i!=j pairs with meshgrid
+        ii, jj = np.meshgrid(np.arange(n_tok_v), np.arange(n_tok_v), indexing='ij')
+        pair_mask = ii != jj
+        i_pairs = ii[pair_mask]
+        j_pairs = jj[pair_mask]
+        n_pairs = len(i_pairs)
+
+        # h_i_all, h_j_all shape: (n_layers, n_heads, n_pairs, d_head)
+        h_i_all = indexed_reps[:, :, i_pairs, :]
+        h_j_all = indexed_reps[:, :, j_pairs, :]
+
+        # For "concat" combination (the only one used in run_probing_pipeline):
+        if combination == "concat":
+            c_ij_all = np.concatenate([h_i_all, h_j_all], axis=-1)  # (n_layers, n_heads, n_pairs, 2*d_head)
+        elif combination == "diff":
+            c_ij_all = h_i_all - h_j_all
+        elif combination == "product":
+            c_ij_all = h_i_all * h_j_all
+        else:  # "full"
+            c_ij_all = np.concatenate([h_i_all, h_j_all, h_i_all - h_j_all, h_i_all * h_j_all], axis=-1)
+
+        # Arc labels (same for all heads)
+        arc_labels = []
+        rel_labels = []
+        distances = []
+        pos_pair_mask = []
+
+        for k in range(n_pairs):
+            pi = i_pairs[k]
+            pj = j_pairs[k]
+            head_of_i = aligned_f[pi]["head_idx"]
+            word_idx_j = aligned_f[pj].get("word_idx", int(pj))
+            is_arc = int(head_of_i == word_idx_j)
+            arc_labels.append(is_arc)
+            rel_labels.append(aligned_f[pi]["dep_rel"] if is_arc else "NO_ARC")
+            distances.append(abs(
+                aligned_f[pi]["scrambled_word_idx"] - aligned_f[pj]["scrambled_word_idx"]
+            ))
+            pos_pair_mask.append(bool(is_arc))
+
+        arc_labels = np.array(arc_labels, dtype=np.int32)
+        distances = np.array(distances, dtype=np.int32)
+        pos_pair_mask = np.array(pos_pair_mask)
+        rel_labels_pos = [rel_labels[k] for k in range(n_pairs) if pos_pair_mask[k]]
+        sid = sent["sentence_id"]
+
+        # Append to accumulators for each (l, h)
+        for l in range(n_layers):
+            for h in range(n_heads):
+                pairs_lh = c_ij_all[l, h]  # (n_pairs, feat_dim)
+                acc = accumulators[(l, h)]
+                acc["X_pairs"].append(pairs_lh)
+                acc["y_arc"].append(arc_labels)
+                acc["distances"].append(distances)
+                acc["sentence_ids"].append(np.full(n_pairs, sid, dtype=np.int32))
+                if pos_pair_mask.any():
+                    acc["X_pairs_pos"].append(pairs_lh[pos_pair_mask])
+                    acc["y_rel_pos"].extend(rel_labels_pos)
+                    acc["sentence_ids_pos"].append(
+                        np.full(pos_pair_mask.sum(), sid, dtype=np.int32)
+                    )
+
+    # Assemble final dataset from accumulators
     dataset = {}
+    d_comb = extractor.d_head * (2 if combination == "concat" else
+                                  1 if combination in ("diff", "product") else 4)
+
     for l in range(n_layers):
         for h in range(n_heads):
-            X_pairs_list = []
-            y_arc_list = []
-            y_rel_pos_list = []    # relation labels for positive pairs only
-            X_pairs_pos_list = []  # representations for positive pairs only
-            distances_list = []
-            sentence_ids_list = []
-            sentence_ids_pos_list = []
-
-            for sent in sentence_data:
-                aligned = sent["aligned"]
-                n_tok = sent["n_aligned"]
-                reps = sent["head_reps"][(l, h)]  # (seq, d_head)
-
-                for idx_i in range(n_tok):
-                    for idx_j in range(n_tok):
-                        if idx_i == idx_j:
-                            continue
-
-                        sw_i = aligned[idx_i]["subword_idx"]
-                        sw_j = aligned[idx_j]["subword_idx"]
-
-                        if sw_i >= reps.shape[0] or sw_j >= reps.shape[0]:
-                            continue
-
-                        h_i = reps[sw_i]
-                        h_j = reps[sw_j]
-                        c_ij = combiner.combine(h_i, h_j)
-
-                        head_of_i = aligned[idx_i]["head_idx"]
-                        is_arc = 0
-                        rel_label = "NO_ARC"
-                        if head_of_i == aligned[idx_j].get("word_idx", idx_j):
-                            is_arc = 1
-                            rel_label = aligned[idx_i]["dep_rel"]
-
-                        X_pairs_list.append(c_ij)
-                        y_arc_list.append(is_arc)
-                        distances_list.append(
-                            abs(
-                                aligned[idx_i]["scrambled_word_idx"]
-                                - aligned[idx_j]["scrambled_word_idx"]
-                            )
-                        )
-                        sentence_ids_list.append(sent["sentence_id"])
-
-                        if is_arc:
-                            X_pairs_pos_list.append(c_ij)
-                            y_rel_pos_list.append(rel_label)
-                            sentence_ids_pos_list.append(sent["sentence_id"])
-
-            if len(X_pairs_list) > 0:
+            acc = accumulators[(l, h)]
+            if len(acc["X_pairs"]) > 0:
                 dataset[(l, h)] = {
-                    "X_pairs": np.stack(X_pairs_list),
-                    "y_arc": np.array(y_arc_list, dtype=np.int32),
-                    "X_pairs_pos": np.stack(X_pairs_pos_list) if X_pairs_pos_list else np.empty((0, X_pairs_list[0].shape[0])),
-                    "y_rel_pos": y_rel_pos_list,
-                    "distances": np.array(distances_list, dtype=np.int32),
-                    "sentence_id": np.array(sentence_ids_list, dtype=np.int32),
-                    "sentence_id_pos": np.array(sentence_ids_pos_list, dtype=np.int32),
+                    "X_pairs": np.concatenate(acc["X_pairs"], axis=0),
+                    "y_arc": np.concatenate(acc["y_arc"], axis=0),
+                    "X_pairs_pos": (
+                        np.concatenate(acc["X_pairs_pos"], axis=0)
+                        if acc["X_pairs_pos"]
+                        else np.empty((0, d_comb))
+                    ),
+                    "y_rel_pos": acc["y_rel_pos"],
+                    "distances": np.concatenate(acc["distances"], axis=0),
+                    "sentence_id": np.concatenate(acc["sentence_ids"], axis=0),
+                    "sentence_id_pos": (
+                        np.concatenate(acc["sentence_ids_pos"], axis=0)
+                        if acc["sentence_ids_pos"]
+                        else np.empty(0, dtype=np.int32)
+                    ),
                 }
             else:
-                d_comb = extractor.d_head * (2 if combination == "concat" else
-                                              1 if combination in ("diff", "product") else 4)
                 dataset[(l, h)] = {
                     "X_pairs": np.empty((0, d_comb)),
                     "y_arc": np.empty(0, dtype=np.int32),
@@ -1048,6 +1177,7 @@ def compute_pairwise_baselines(
     test_size: float = 0.2,
     random_state: int = 42,
     sentence_split=None,
+    batch_size: int = 16,
 ):
     """Word-embedding pairwise baseline and distance baseline."""
     if max_sentences:
@@ -1065,11 +1195,12 @@ def compute_pairwise_baselines(
     sentence_ids_all = []
     sentence_ids_pos = []
 
+    total = len(scrambled_sentences)
     for i, (scrambled, original) in enumerate(
         zip(scrambled_sentences, original_sentences)
     ):
         if i % 100 == 0:
-            print(f"  Pairwise baseline: {i}/{len(scrambled_sentences)}", flush=True)
+            print(f"  Pairwise baseline: {i}/{total}", flush=True)
 
         labels = labeler.extract_labels(original)
         inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
@@ -1161,6 +1292,7 @@ def compute_word_embedding_baseline(
     test_size: float = 0.2,
     random_state: int = 42,
     sentence_split=None,
+    batch_size: int = 16,
 ):
     """Train probes on word embeddings (wte) as a control baseline."""
     if max_sentences:
@@ -1229,6 +1361,8 @@ def run_probing_pipeline(
     max_sentences: int = None,
     device=None,
     sentence_split=None,
+    batch_size: int = 16,
+    fp16: bool = False,
 ):
 
     print(f"\n{'='*60}", flush=True)
@@ -1236,7 +1370,7 @@ def run_probing_pipeline(
     print(f"{'='*60}", flush=True)
 
     extractor = HeadRepresentationExtractor(
-        model_path, tokenizer_path=tokenizer_path, device=device,
+        model_path, tokenizer_path=tokenizer_path, device=device, fp16=fp16,
     )
 
     # Build dataset
@@ -1244,6 +1378,7 @@ def run_probing_pipeline(
     dataset = build_probing_dataset(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
+        batch_size=batch_size,
     )
 
     # Word-embedding baseline (token-level)
@@ -1252,6 +1387,7 @@ def run_probing_pipeline(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
         sentence_split=sentence_split,
+        batch_size=batch_size,
     )
 
     # Probe each head (token-level)
@@ -1291,6 +1427,7 @@ def run_probing_pipeline(
         extractor, labeler, scrambled_sentences, original_sentences,
         combination="concat",
         max_sentences=max_sentences,
+        batch_size=batch_size,
     )
 
     print("\n  Computing pairwise baselines...", flush=True)
@@ -1299,6 +1436,7 @@ def run_probing_pipeline(
         combination="concat",
         max_sentences=max_sentences,
         sentence_split=sentence_split,
+        batch_size=batch_size,
     )
 
     pw_prober = PairwiseDependencyProber(combination="concat", sentence_split=sentence_split)
@@ -1633,11 +1771,22 @@ def parse_args():
         "--spacy_model", type=str, default="en_core_web_sm",
         help="spaCy model for syntactic parsing (default: en_core_web_sm)",
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=16,
+        help="Batch size for GPU forward passes",
+    )
+    parser.add_argument(
+        "--fp16", action="store_true",
+        help="Load models with fp16 weights",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
     device = torch.device(args.device) if args.device else None
     tokenizer_path = args.tokenizer or args.impossible_model
@@ -1663,6 +1812,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        batch_size=args.batch_size,
+        fp16=args.fp16,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -1677,6 +1828,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        batch_size=args.batch_size,
+        fp16=args.fp16,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -1691,6 +1844,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        batch_size=args.batch_size,
+        fp16=args.fp16,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
