@@ -686,7 +686,8 @@ def run_single_layer_ablations(
                 }
                 print(
                     f"[{key}] layer {layer:2d}  EM={res.em:.3f}  "
-                    f"depF1={res.dep_f1:.3f}  ΔEM={delta_em:+.3f}  ΔF1={delta_f1:+.3f}"
+                    f"depF1={res.dep_f1:.3f}  ΔEM={delta_em:+.3f}  ΔF1={delta_f1:+.3f}",
+                    flush=True,
                 )
     wrapper.clear()
     return results
@@ -714,7 +715,7 @@ def run_cumulative_ablations(
             "delta_em":     baseline.em     - res.em,
             "delta_dep_f1": baseline.dep_f1 - res.dep_f1,
         })
-        print(f"[early] layers 0-{k}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}")
+        print(f"[early] layers 0-{k}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}", flush=True)
 
     # Late: ablate layers k..n-1
     for k in range(n):
@@ -727,7 +728,7 @@ def run_cumulative_ablations(
             "delta_em":     baseline.em     - res.em,
             "delta_dep_f1": baseline.dep_f1 - res.dep_f1,
         })
-        print(f"[late] layers {k}-{n-1}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}")
+        print(f"[late] layers {k}-{n-1}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}", flush=True)
 
     # Middle: sliding windows of width 2 and 3
     for start in range(n):
@@ -746,7 +747,8 @@ def run_cumulative_ablations(
                 "delta_dep_f1": baseline.dep_f1 - res.dep_f1,
             })
             print(
-                f"[middle] layers {start}-{end}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}"
+                f"[middle] layers {start}-{end}  EM={res.em:.3f}  depF1={res.dep_f1:.3f}",
+                flush=True,
             )
 
     wrapper.clear()
@@ -904,49 +906,50 @@ def main() -> None:
             pass
 
     dtype = torch.float16 if (cfg.fp16 and cfg.device.startswith("cuda")) else torch.float32
-    print(f"Device: {cfg.device}  dtype: {dtype}  batch_size: {cfg.batch_size}")
-    print(f"Loading dataset: {cfg.dataset}")
+    print(f"Device: {cfg.device}  dtype: {dtype}  batch_size: {cfg.batch_size}", flush=True)
+    print(f"Loading dataset: {cfg.dataset}", flush=True)
     pairs = load_dataset(cfg.dataset, cfg.num_sentences)
-    print(f"  -> {len(pairs)} sentence pairs")
+    print(f"  -> {len(pairs)} sentence pairs", flush=True)
 
     # ------------------------------------------------------------------
     # Translator (fine-tuned; uses "Fix this text:" prompt format)
     # ------------------------------------------------------------------
-    print(f"\nLoading translator: {cfg.translator_model}")
+    print(f"\nLoading translator: {cfg.translator_model}", flush=True)
     translator_model, tokenizer = load_model(cfg.translator_model, cfg.device, dtype=dtype)
     translator = InterventionModel(
         translator_model, tokenizer, cfg.device, is_translator=True
     )
 
-    print("Estimating activation statistics for mean/random interventions ...")
+    print("Estimating activation statistics for mean/random interventions ...", flush=True)
     translator.estimate_activation_statistics(
         [p[0] for p in pairs[:50]], batch_size=cfg.batch_size
     )
 
     dep_eval = DependencyEvaluator()
     if dep_eval.nlp is None:
-        print("  WARNING: spaCy en_core_web_sm not available; dep_f1/UAS/LAS = 0.")
+        print("  WARNING: spaCy en_core_web_sm not available; dep_f1/UAS/LAS = 0.", flush=True)
 
-    print("\nEvaluating intact translator baseline ...")
+    print("\nEvaluating intact translator baseline ...", flush=True)
     translator.clear()
     baseline = evaluate(translator, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size)
     print(
         f"  baseline  EM={baseline.em:.3f}  tokAcc={baseline.token_acc:.3f}  "
-        f"BLEU1={baseline.bleu1:.3f}  depF1={baseline.dep_f1:.3f}"
+        f"BLEU1={baseline.bleu1:.3f}  depF1={baseline.dep_f1:.3f}",
+        flush=True,
     )
 
     # Sanity-check: show first prediction so prompt format can be verified.
     sample_pred = translator.generate(
         [pairs[0][0]], max_new_tokens=cfg.max_new_tokens, batch_size=cfg.batch_size
     )[0]
-    print(f"\n  [sanity] src : {pairs[0][0]}")
-    print(f"  [sanity] ref : {pairs[0][1]}")
-    print(f"  [sanity] pred: {sample_pred}\n")
+    print(f"\n  [sanity] src : {pairs[0][0]}", flush=True)
+    print(f"  [sanity] ref : {pairs[0][1]}", flush=True)
+    print(f"  [sanity] pred: {sample_pred}\n", flush=True)
 
     # ------------------------------------------------------------------
     # Single-layer ablations
     # ------------------------------------------------------------------
-    print("Running single-layer ablations (12 layers x 3 kinds x 3 scopes) ...")
+    print("Running single-layer ablations (12 layers x 3 kinds x 3 scopes) ...", flush=True)
     single_results = run_single_layer_ablations(
         translator, pairs, dep_eval, cfg, baseline
     )
@@ -954,7 +957,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Cumulative ablations
     # ------------------------------------------------------------------
-    print("\nRunning cumulative ablations (early / late / middle windows) ...")
+    print("\nRunning cumulative ablations (early / late / middle windows) ...", flush=True)
     cumulative_results = run_cumulative_ablations(
         translator, pairs, dep_eval, cfg, baseline
     )
@@ -962,52 +965,54 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Interaction analysis
     # ------------------------------------------------------------------
-    print("\nComputing pairwise additive baselines for interaction analysis ...")
+    print("\nComputing pairwise additive baselines for interaction analysis ...", flush=True)
     interaction_results = compute_interactions(single_results)
 
     # ------------------------------------------------------------------
     # Impossible model baseline (raw scrambled text — no translator prompt)
     # ------------------------------------------------------------------
-    print(f"\nLoading impossible model: {cfg.impossible_model}")
+    print(f"\nLoading impossible model: {cfg.impossible_model}", flush=True)
     imp_model, imp_tok = load_model(cfg.impossible_model, cfg.device, dtype=dtype)
     impossible = InterventionModel(
         imp_model, imp_tok, cfg.device, is_translator=False
     )
-    print("Evaluating impossible baseline ...")
+    print("Evaluating impossible baseline ...", flush=True)
     impossible_baseline = evaluate(
         impossible, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size
     )
     print(
         f"  impossible  EM={impossible_baseline.em:.3f}  "
-        f"depF1={impossible_baseline.dep_f1:.3f}"
+        f"depF1={impossible_baseline.dep_f1:.3f}",
+        flush=True,
     )
 
     # ------------------------------------------------------------------
     # Base GPT-2 baseline (raw scrambled text)
     # ------------------------------------------------------------------
-    print(f"\nLoading base model: {cfg.base_model}")
+    print(f"\nLoading base model: {cfg.base_model}", flush=True)
     base_model, base_tok = load_model(cfg.base_model, cfg.device, dtype=dtype)
     base_wrapper = InterventionModel(
         base_model, base_tok, cfg.device, is_translator=False
     )
-    print("Evaluating base GPT-2 baseline ...")
+    print("Evaluating base GPT-2 baseline ...", flush=True)
     base_baseline = evaluate(
         base_wrapper, pairs, dep_eval, cfg.max_new_tokens, cfg.batch_size
     )
     print(
-        f"  base GPT-2  EM={base_baseline.em:.3f}  depF1={base_baseline.dep_f1:.3f}"
+        f"  base GPT-2  EM={base_baseline.em:.3f}  depF1={base_baseline.dep_f1:.3f}",
+        flush=True,
     )
 
     # ------------------------------------------------------------------
     # Distance to impossible
     # ------------------------------------------------------------------
-    print("\nComputing distance to impossible per ablated layer ...")
+    print("\nComputing distance to impossible per ablated layer ...", flush=True)
     distance_to_impossible = compare_with_impossible(single_results, impossible_baseline)
 
     # ------------------------------------------------------------------
     # Probing correlation
     # ------------------------------------------------------------------
-    print("Correlating ablation impact with probing divergence ...")
+    print("Correlating ablation impact with probing divergence ...", flush=True)
     probing_corr = correlate_with_probing(single_results, cfg.probing_results)
 
     # ------------------------------------------------------------------
@@ -1036,10 +1041,10 @@ def main() -> None:
         "probing_correlation":         probing_corr,
     }
 
-    print(f"\nWriting results to {cfg.output}")
+    print(f"\nWriting results to {cfg.output}", flush=True)
     with open(cfg.output, "w") as fh:
         json.dump(output, fh, indent=2)
-    print("Done.")
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
