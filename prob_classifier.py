@@ -31,9 +31,7 @@ class SyntacticLabeler:
     def __init__(self, spacy_model: str = "en_core_web_sm"):
         self.nlp = spacy.load(spacy_model)
 
-    def extract_labels(self, sentence: str):
-        """Return per-token POS, dep relation, head index, and tree depth."""
-        doc = self.nlp(sentence)
+    def _extract_labels_from_doc(self, doc):
         tokens, pos_tags, dep_rels, head_indices, depths = [], [], [], [], []
         for tok in doc:
             tokens.append(tok.text)
@@ -48,6 +46,21 @@ class SyntacticLabeler:
             "head_idx": head_indices,
             "depth": depths,
         }
+
+    def extract_labels(self, sentence: str):
+        """Return per-token POS, dep relation, head index, and tree depth."""
+        return self._extract_labels_from_doc(self.nlp(sentence))
+
+    def extract_labels_batch(self, sentences: list[str], batch_size: int = 128):
+        """Parse many original sentences at once with spaCy.pipe."""
+        return [
+            self._extract_labels_from_doc(doc)
+            for doc in self.nlp.pipe(sentences, batch_size=batch_size)
+        ]
+
+    def tokenize_batch(self, sentences: list[str], batch_size: int = 256):
+        """Tokenize many scrambled sentences without running the parser."""
+        return list(self.nlp.tokenizer.pipe(sentences, batch_size=batch_size))
 
     @staticmethod
     def _tree_depth(token) -> int:
@@ -304,9 +317,11 @@ def align_scrambled_words_to_labels(
     offsets,
     labeler: SyntacticLabeler,
     word_labels: dict,
+    scrambled_doc=None,
 ):
     """Map scrambled tokens to original labels by token identity and occurrence."""
-    scrambled_doc = labeler.nlp.make_doc(scrambled_sentence)
+    if scrambled_doc is None:
+        scrambled_doc = labeler.nlp.make_doc(scrambled_sentence)
 
     original_occurrences = defaultdict(deque)
     for original_idx, token_text in enumerate(word_labels["tokens"]):
@@ -355,6 +370,26 @@ def build_sentence_split(n_sentences: int, test_size: float = 0.2, val_size: flo
     return {"train": np.asarray(train_ids), "val": np.asarray(val_ids), "test": np.asarray(test_ids)}
 
 
+def prepare_syntax_cache(
+    labeler: SyntacticLabeler,
+    scrambled_sentences: list[str],
+    original_sentences: list[str],
+    batch_size: int = 128,
+):
+    """Precompute reusable CPU-side syntax data shared across model runs."""
+    print("\nPrecomputing syntax cache...", flush=True)
+    original_labels = labeler.extract_labels_batch(
+        original_sentences, batch_size=batch_size,
+    )
+    scrambled_docs = labeler.tokenize_batch(
+        scrambled_sentences, batch_size=max(64, batch_size * 2),
+    )
+    return {
+        "original_labels": original_labels,
+        "scrambled_docs": scrambled_docs,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dataset construction for probing
 # ---------------------------------------------------------------------------
@@ -366,19 +401,39 @@ def build_probing_dataset(
     original_sentences: list[str],
     max_sentences: int = None,
     batch_size: int = 16,
+    original_labels_list: list[dict] | None = None,
+    scrambled_docs: list | None = None,
 ):
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
+        if original_labels_list is not None:
+            original_labels_list = original_labels_list[:max_sentences]
+        if scrambled_docs is not None:
+            scrambled_docs = scrambled_docs[:max_sentences]
+
+    if original_labels_list is None:
+        original_labels_list = labeler.extract_labels_batch(
+            original_sentences, batch_size=max(64, batch_size * 4),
+        )
+    if scrambled_docs is None:
+        scrambled_docs = labeler.tokenize_batch(
+            scrambled_sentences, batch_size=max(64, batch_size * 8),
+        )
 
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
 
     dataset = {
-        (l, h): {"X": [], "pos": [], "dep_rel": [], "depth": [], "head_idx": [], "sentence_id": []}
+        (l, h): {"X": []}
         for l in range(n_layers)
         for h in range(n_heads)
     }
+    shared_pos = []
+    shared_dep_rel = []
+    shared_depth = []
+    shared_head_idx = []
+    shared_sentence_id = []
 
     skipped = 0
     total = len(scrambled_sentences)
@@ -402,28 +457,39 @@ def build_probing_dataset(
                 skipped += 1
                 continue
 
-            # Gold labels from original sentence
-            labels = labeler.extract_labels(original)
+            labels = original_labels_list[i]
+            scrambled_doc = scrambled_docs[i]
 
             # Align scrambled words back to original labels by identity.
-            aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+            aligned = align_scrambled_words_to_labels(
+                scrambled, offsets, labeler, labels, scrambled_doc=scrambled_doc,
+            )
             if len(aligned) == 0:
                 skipped += 1
                 continue
 
-            # Collect aligned representations and labels
-            for entry in aligned:
-                sw_idx = entry["subword_idx"]
-                for l in range(n_layers):
-                    for h in range(n_heads):
-                        rep = head_reps[(l, h)]
-                        if sw_idx < rep.shape[0]:
-                            dataset[(l, h)]["X"].append(rep[sw_idx])
-                            dataset[(l, h)]["pos"].append(entry["pos"])
-                            dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
-                            dataset[(l, h)]["depth"].append(entry["depth"])
-                            dataset[(l, h)]["head_idx"].append(entry["head_idx"])
-                            dataset[(l, h)]["sentence_id"].append(i)
+            seq_len = next(iter(head_reps.values())).shape[0]
+            valid_entries = [
+                entry for entry in aligned
+                if entry["subword_idx"] < seq_len
+            ]
+            if not valid_entries:
+                skipped += 1
+                continue
+
+            sw_indices = np.array(
+                [entry["subword_idx"] for entry in valid_entries],
+                dtype=np.int32,
+            )
+
+            shared_pos.extend(entry["pos"] for entry in valid_entries)
+            shared_dep_rel.extend(entry["dep_rel"] for entry in valid_entries)
+            shared_depth.extend(entry["depth"] for entry in valid_entries)
+            shared_head_idx.extend(entry["head_idx"] for entry in valid_entries)
+            shared_sentence_id.extend([i] * len(valid_entries))
+
+            for key, rep in head_reps.items():
+                dataset[key]["X"].append(rep[sw_indices])
 
     if skipped:
         print(
@@ -431,16 +497,20 @@ def build_probing_dataset(
             flush=True,
         )
 
+    shared_depth_arr = np.array(shared_depth, dtype=np.float32)
+    shared_sentence_id_arr = np.array(shared_sentence_id, dtype=np.int32)
+
     # Convert lists to arrays
     for key in dataset:
         if len(dataset[key]["X"]) > 0:
-            dataset[key]["X"] = np.stack(dataset[key]["X"])
-            dataset[key]["depth"] = np.array(dataset[key]["depth"], dtype=np.float32)
-            dataset[key]["sentence_id"] = np.array(dataset[key]["sentence_id"], dtype=np.int32)
+            dataset[key]["X"] = np.concatenate(dataset[key]["X"], axis=0)
         else:
             dataset[key]["X"] = np.empty((0, extractor.d_head))
-            dataset[key]["depth"] = np.empty(0)
-            dataset[key]["sentence_id"] = np.empty(0, dtype=np.int32)
+        dataset[key]["pos"] = shared_pos
+        dataset[key]["dep_rel"] = shared_dep_rel
+        dataset[key]["depth"] = shared_depth_arr
+        dataset[key]["head_idx"] = shared_head_idx
+        dataset[key]["sentence_id"] = shared_sentence_id_arr
 
     return dataset
 
@@ -957,6 +1027,8 @@ def build_pairwise_dataset(
     combination: str = "concat",
     max_sentences: int = None,
     batch_size: int = 16,
+    original_labels_list: list[dict] | None = None,
+    scrambled_docs: list | None = None,
 ):
     """Build pairwise token-pair dataset for dependency structure probing.
 
@@ -972,6 +1044,19 @@ def build_pairwise_dataset(
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
+        if original_labels_list is not None:
+            original_labels_list = original_labels_list[:max_sentences]
+        if scrambled_docs is not None:
+            scrambled_docs = scrambled_docs[:max_sentences]
+
+    if original_labels_list is None:
+        original_labels_list = labeler.extract_labels_batch(
+            original_sentences, batch_size=max(64, batch_size * 4),
+        )
+    if scrambled_docs is None:
+        scrambled_docs = labeler.tokenize_batch(
+            scrambled_sentences, batch_size=max(64, batch_size * 8),
+        )
 
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
@@ -1004,8 +1089,10 @@ def build_pairwise_dataset(
                 skipped += 1
                 continue
 
-            labels = labeler.extract_labels(original)
-            aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+            labels = original_labels_list[i]
+            aligned = align_scrambled_words_to_labels(
+                scrambled, offsets, labeler, labels, scrambled_doc=scrambled_docs[i],
+            )
             if len(aligned) < 2:  # need at least 2 tokens for pairs
                 skipped += 1
                 continue
@@ -1178,11 +1265,26 @@ def compute_pairwise_baselines(
     random_state: int = 42,
     sentence_split=None,
     batch_size: int = 16,
+    original_labels_list: list[dict] | None = None,
+    scrambled_docs: list | None = None,
 ):
     """Word-embedding pairwise baseline and distance baseline."""
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
+        if original_labels_list is not None:
+            original_labels_list = original_labels_list[:max_sentences]
+        if scrambled_docs is not None:
+            scrambled_docs = scrambled_docs[:max_sentences]
+
+    if original_labels_list is None:
+        original_labels_list = labeler.extract_labels_batch(
+            original_sentences, batch_size=max(64, batch_size * 4),
+        )
+    if scrambled_docs is None:
+        scrambled_docs = labeler.tokenize_batch(
+            scrambled_sentences, batch_size=max(64, batch_size * 8),
+        )
 
     combiner = PairwiseDependencyProber(combination=combination)
     wte = extractor.model.transformer.wte
@@ -1202,7 +1304,7 @@ def compute_pairwise_baselines(
         if i % 100 == 0:
             print(f"  Pairwise baseline: {i}/{total}", flush=True)
 
-        labels = labeler.extract_labels(original)
+        labels = original_labels_list[i]
         inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
         if inputs["input_ids"].shape[1] == 0:
@@ -1211,7 +1313,9 @@ def compute_pairwise_baselines(
         with torch.no_grad():
             embeddings = wte(inputs["input_ids"])[0].cpu().numpy()
 
-        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+        aligned = align_scrambled_words_to_labels(
+            scrambled, offsets, labeler, labels, scrambled_doc=scrambled_docs[i],
+        )
         if len(aligned) < 2:
             continue
 
@@ -1293,11 +1397,26 @@ def compute_word_embedding_baseline(
     random_state: int = 42,
     sentence_split=None,
     batch_size: int = 16,
+    original_labels_list: list[dict] | None = None,
+    scrambled_docs: list | None = None,
 ):
     """Train probes on word embeddings (wte) as a control baseline."""
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
+        if original_labels_list is not None:
+            original_labels_list = original_labels_list[:max_sentences]
+        if scrambled_docs is not None:
+            scrambled_docs = scrambled_docs[:max_sentences]
+
+    if original_labels_list is None:
+        original_labels_list = labeler.extract_labels_batch(
+            original_sentences, batch_size=max(64, batch_size * 4),
+        )
+    if scrambled_docs is None:
+        scrambled_docs = labeler.tokenize_batch(
+            scrambled_sentences, batch_size=max(64, batch_size * 8),
+        )
 
     X_all, pos_all, dep_all, depth_all, sentence_ids = [], [], [], [], []
     wte = extractor.model.transformer.wte  # word token embedding layer
@@ -1308,7 +1427,7 @@ def compute_word_embedding_baseline(
         if i % 100 == 0:
             print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}", flush=True)
 
-        labels = labeler.extract_labels(original)
+        labels = original_labels_list[i]
         inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
         if inputs["input_ids"].shape[1] == 0:
@@ -1317,7 +1436,9 @@ def compute_word_embedding_baseline(
         with torch.no_grad():
             embeddings = wte(inputs["input_ids"])[0].cpu().numpy()  # (seq, emb)
 
-        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
+        aligned = align_scrambled_words_to_labels(
+            scrambled, offsets, labeler, labels, scrambled_doc=scrambled_docs[i],
+        )
 
         for entry in aligned:
             sw_idx = entry["subword_idx"]
@@ -1363,6 +1484,7 @@ def run_probing_pipeline(
     sentence_split=None,
     batch_size: int = 16,
     fp16: bool = False,
+    syntax_cache: dict | None = None,
 ):
 
     print(f"\n{'='*60}", flush=True)
@@ -1379,6 +1501,12 @@ def run_probing_pipeline(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
         batch_size=batch_size,
+        original_labels_list=(
+            syntax_cache["original_labels"] if syntax_cache is not None else None
+        ),
+        scrambled_docs=(
+            syntax_cache["scrambled_docs"] if syntax_cache is not None else None
+        ),
     )
 
     # Word-embedding baseline (token-level)
@@ -1388,6 +1516,12 @@ def run_probing_pipeline(
         max_sentences=max_sentences,
         sentence_split=sentence_split,
         batch_size=batch_size,
+        original_labels_list=(
+            syntax_cache["original_labels"] if syntax_cache is not None else None
+        ),
+        scrambled_docs=(
+            syntax_cache["scrambled_docs"] if syntax_cache is not None else None
+        ),
     )
 
     # Probe each head (token-level)
@@ -1428,6 +1562,12 @@ def run_probing_pipeline(
         combination="concat",
         max_sentences=max_sentences,
         batch_size=batch_size,
+        original_labels_list=(
+            syntax_cache["original_labels"] if syntax_cache is not None else None
+        ),
+        scrambled_docs=(
+            syntax_cache["scrambled_docs"] if syntax_cache is not None else None
+        ),
     )
 
     print("\n  Computing pairwise baselines...", flush=True)
@@ -1437,6 +1577,12 @@ def run_probing_pipeline(
         max_sentences=max_sentences,
         sentence_split=sentence_split,
         batch_size=batch_size,
+        original_labels_list=(
+            syntax_cache["original_labels"] if syntax_cache is not None else None
+        ),
+        scrambled_docs=(
+            syntax_cache["scrambled_docs"] if syntax_cache is not None else None
+        ),
     )
 
     pw_prober = PairwiseDependencyProber(combination="concat", sentence_split=sentence_split)
@@ -1800,6 +1946,12 @@ if __name__ == "__main__":
 
     # Syntactic labeler
     labeler = SyntacticLabeler(args.spacy_model)
+    syntax_cache = prepare_syntax_cache(
+        labeler,
+        scrambled_sentences,
+        original_sentences,
+        batch_size=max(64, args.batch_size * 4),
+    )
 
     # ---- Probe translator model ----
     results_translator = run_probing_pipeline(
@@ -1814,6 +1966,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         batch_size=args.batch_size,
         fp16=args.fp16,
+        syntax_cache=syntax_cache,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -1830,6 +1983,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         batch_size=args.batch_size,
         fp16=args.fp16,
+        syntax_cache=syntax_cache,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -1846,6 +2000,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         batch_size=args.batch_size,
         fp16=args.fp16,
+        syntax_cache=syntax_cache,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
