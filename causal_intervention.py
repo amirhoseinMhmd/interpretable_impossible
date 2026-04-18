@@ -61,6 +61,21 @@ except Exception:
     _SCIPY_OK = False
 
 
+def detect_best_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None:
+        try:
+            if mps_backend.is_available() and mps_backend.is_built():
+                return "mps"
+        except Exception:
+            pass
+
+    return "cpu"
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -79,7 +94,7 @@ class InterventionConfig:
     num_sentences: int = 200
     max_new_tokens: int = 64
     batch_size: int = 32
-    device: str = "cuda" if torch.cuda.is_available() else "mps"
+    device: str = detect_best_device()
     fp16: bool = False
     seed: int = 0
     em_threshold: float = 0.05
@@ -872,7 +887,8 @@ def parse_args() -> InterventionConfig:
                    help="Load models in float16 (CUDA only) for ~2x speedup.")
     p.add_argument(
         "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
     )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -894,6 +910,8 @@ def parse_args() -> InterventionConfig:
 
 def main() -> None:
     cfg = parse_args()
+    if cfg.device == "auto":
+        cfg.device = detect_best_device()
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 

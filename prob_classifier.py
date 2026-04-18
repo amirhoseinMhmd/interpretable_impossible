@@ -21,6 +21,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2.modeling_gpt2 import ALL_ATTENTION_FUNCTIONS, eager_attention_forward
 
 
+def detect_best_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None:
+        try:
+            if mps_backend.is_available() and mps_backend.is_built():
+                return torch.device("mps")
+        except Exception:
+            pass
+
+    return torch.device("cpu")
+
+
 # ---------------------------------------------------------------------------
 # Syntactic label extraction (gold labels from original/possible sentences)
 # ---------------------------------------------------------------------------
@@ -82,14 +97,9 @@ class HeadRepresentationExtractor:
 
     def __init__(self, model_path: str, tokenizer_path: str = None, device=None, fp16: bool = False):
         if device is None:
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-            else:
-                self.device = torch.device("cpu")
+            self.device = detect_best_device()
         else:
-            self.device = device
+            self.device = torch.device(device) if isinstance(device, str) else device
         print(f"Using device: {self.device}", flush=True)
 
         tok_path = tokenizer_path or model_path
@@ -1921,7 +1931,7 @@ def parse_args():
         "--max_sentences", type=int, default=None,
     )
     parser.add_argument(
-        "--device", type=str, default=None, choices=["cuda", "mps", "cpu"],
+        "--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"],
     )
     parser.add_argument(
         "--spacy_model", type=str, default="en_core_web_sm",
@@ -1944,7 +1954,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
-    device = torch.device(args.device) if args.device else None
+    device = detect_best_device() if args.device == "auto" else torch.device(args.device)
     tokenizer_path = args.tokenizer or args.impossible_model
 
     # Load dataset
