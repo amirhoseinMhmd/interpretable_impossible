@@ -17,6 +17,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2.modeling_gpt2 import ALL_ATTENTION_FUNCTIONS, eager_attention_forward
 
@@ -71,12 +72,22 @@ class SyntacticLabeler:
         """Parse many original sentences at once with spaCy.pipe."""
         return [
             self._extract_labels_from_doc(doc)
-            for doc in self.nlp.pipe(sentences, batch_size=batch_size)
+            for doc in tqdm(
+                self.nlp.pipe(sentences, batch_size=batch_size),
+                total=len(sentences),
+                desc="spaCy parse",
+                unit="sent",
+            )
         ]
 
     def tokenize_batch(self, sentences: list[str], batch_size: int = 256):
         """Tokenize many scrambled sentences without running the parser."""
-        return list(self.nlp.tokenizer.pipe(sentences, batch_size=batch_size))
+        return list(tqdm(
+            self.nlp.tokenizer.pipe(sentences, batch_size=batch_size),
+            total=len(sentences),
+            desc="spaCy tokenize",
+            unit="sent",
+        ))
 
     @staticmethod
     def _tree_depth(token) -> int:
@@ -458,12 +469,15 @@ def build_probing_dataset(
     skipped = 0
     total = len(scrambled_sentences)
 
-    for batch_start in range(0, total, batch_size):
+    batch_starts = range(0, total, batch_size)
+    for batch_start in tqdm(
+        batch_starts,
+        total=(total + batch_size - 1) // batch_size,
+        desc="Probing dataset",
+        unit="batch",
+    ):
         batch_scrambled = scrambled_sentences[batch_start:batch_start + batch_size]
         batch_original = original_sentences[batch_start:batch_start + batch_size]
-
-        if batch_start % 100 == 0:
-            print(f"  Building probing data: {batch_start}/{total}", flush=True)
 
         batch_results = extractor.extract_batch(batch_scrambled)
 
@@ -1090,12 +1104,15 @@ def build_pairwise_dataset(
     skipped = 0
     total = len(scrambled_sentences)
 
-    for batch_start in range(0, total, batch_size):
+    batch_starts = range(0, total, batch_size)
+    for batch_start in tqdm(
+        batch_starts,
+        total=(total + batch_size - 1) // batch_size,
+        desc="Pairwise dataset",
+        unit="batch",
+    ):
         batch_scrambled = scrambled_sentences[batch_start:batch_start + batch_size]
         batch_original = original_sentences[batch_start:batch_start + batch_size]
-
-        if batch_start % 100 == 0:
-            print(f"  Building pairwise data: {batch_start}/{total}", flush=True)
 
         batch_results = extractor.extract_batch(batch_scrambled)
 
@@ -1146,7 +1163,12 @@ def build_pairwise_dataset(
         for h in range(n_heads)
     }
 
-    for sent in sentence_data:
+    for sent in tqdm(
+        sentence_data,
+        total=len(sentence_data),
+        desc="Pairwise assembly",
+        unit="sent",
+    ):
         aligned = sent["aligned"]
         n_tok = sent["n_aligned"]
 
@@ -1319,11 +1341,13 @@ def compute_pairwise_baselines(
 
     total = len(scrambled_sentences)
     for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
+        tqdm(
+            zip(scrambled_sentences, original_sentences),
+            total=total,
+            desc="Pairwise baseline",
+            unit="sent",
+        )
     ):
-        if i % 100 == 0:
-            print(f"  Pairwise baseline: {i}/{total}", flush=True)
-
         labels = original_labels_list[i]
         inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
@@ -1441,12 +1465,15 @@ def compute_word_embedding_baseline(
     X_all, pos_all, dep_all, depth_all, sentence_ids = [], [], [], [], []
     wte = extractor.model.transformer.wte  # word token embedding layer
 
+    total = len(scrambled_sentences)
     for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
+        tqdm(
+            zip(scrambled_sentences, original_sentences),
+            total=total,
+            desc="Word-emb baseline",
+            unit="sent",
+        )
     ):
-        if i % 100 == 0:
-            print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}", flush=True)
-
         labels = original_labels_list[i]
         inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
@@ -1551,29 +1578,24 @@ def run_probing_pipeline(
 
     per_head = {}
     total = n_layers * n_heads
-    done = 0
+    head_keys = [(l, h) for l in range(n_layers) for h in range(n_heads)]
 
-    for l in range(n_layers):
-        for h in range(n_heads):
-            done += 1
-            if done % 24 == 0:
-                print(f"  Probing head {done}/{total}", flush=True)
+    for l, h in tqdm(head_keys, total=total, desc="Token-level heads", unit="head"):
+        data = dataset[(l, h)]
+        X = data["X"]
+        if X.shape[0] < 20:
+            per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
+            continue
 
-            data = dataset[(l, h)]
-            X = data["X"]
-            if X.shape[0] < 20:
-                per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
-                continue
+        pos_result = prober.probe_pos(X, data["pos"], data["sentence_id"])
+        dep_result = prober.probe_dependency(X, data["dep_rel"], data["sentence_id"])
+        depth_result = prober.probe_depth(X, data["depth"], data["sentence_id"])
 
-            pos_result = prober.probe_pos(X, data["pos"], data["sentence_id"])
-            dep_result = prober.probe_dependency(X, data["dep_rel"], data["sentence_id"])
-            depth_result = prober.probe_depth(X, data["depth"], data["sentence_id"])
-
-            per_head[(l, h)] = {
-                "pos": pos_result,
-                "dep_rel": dep_result,
-                "depth": depth_result,
-            }
+        per_head[(l, h)] = {
+            "pos": pos_result,
+            "dep_rel": dep_result,
+            "depth": depth_result,
+        }
 
     # ---- Pairwise dependency structure probing ----
     print("\n  Building pairwise probing dataset...", flush=True)
@@ -1607,32 +1629,26 @@ def run_probing_pipeline(
 
     pw_prober = PairwiseDependencyProber(combination="concat", sentence_split=sentence_split)
     per_head_pairwise = {}
-    done = 0
 
-    for l in range(n_layers):
-        for h in range(n_heads):
-            done += 1
-            if done % 24 == 0:
-                print(f"  Pairwise probing head {done}/{total}", flush=True)
+    for l, h in tqdm(head_keys, total=total, desc="Pairwise heads", unit="head"):
+        pw_data = pw_dataset[(l, h)]
+        X_pairs = pw_data["X_pairs"]
 
-            pw_data = pw_dataset[(l, h)]
-            X_pairs = pw_data["X_pairs"]
-
-            if X_pairs.shape[0] < 20:
-                per_head_pairwise[(l, h)] = {
-                    "arc": None, "relation": None,
-                }
-                continue
-
-            arc_result = pw_prober.probe_arc(X_pairs, pw_data["y_arc"], pw_data["sentence_id"])
-            rel_result = pw_prober.probe_relation(
-                pw_data["X_pairs_pos"], pw_data["y_rel_pos"], pw_data["sentence_id_pos"],
-            )
-
+        if X_pairs.shape[0] < 20:
             per_head_pairwise[(l, h)] = {
-                "arc": arc_result,
-                "relation": rel_result,
+                "arc": None, "relation": None,
             }
+            continue
+
+        arc_result = pw_prober.probe_arc(X_pairs, pw_data["y_arc"], pw_data["sentence_id"])
+        rel_result = pw_prober.probe_relation(
+            pw_data["X_pairs_pos"], pw_data["y_rel_pos"], pw_data["sentence_id_pos"],
+        )
+
+        per_head_pairwise[(l, h)] = {
+            "arc": arc_result,
+            "relation": rel_result,
+        }
 
     # Layer-wise summaries
     layer_summary = _compute_layer_summary(per_head, n_layers, n_heads)
