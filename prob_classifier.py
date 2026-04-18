@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 from collections import defaultdict, deque
 from types import MethodType
@@ -100,7 +101,7 @@ class HeadRepresentationExtractor:
             model_path,
             attn_implementation="eager",
             output_hidden_states=False,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         self.model.to(self.device)
         self.model.eval()
@@ -114,6 +115,7 @@ class HeadRepresentationExtractor:
         # Patch attention blocks to capture true per-head outputs
         self._head_outputs = {}
         self._original_attn_forwards = {}
+        self._upcast_accepts_head_mask = False
         self._patch_attention_modules()
 
     # -- attention patching -------------------------------------------------
@@ -122,6 +124,9 @@ class HeadRepresentationExtractor:
         """Patch GPT-2 attention blocks to capture outputs before c_proj mixes heads."""
         for layer_idx in range(self.n_layers):
             attn_module = self.model.transformer.h[layer_idx].attn
+            if layer_idx == 0:
+                upcast_sig = inspect.signature(attn_module._upcast_and_reordered_attn)
+                self._upcast_accepts_head_mask = "head_mask" in upcast_sig.parameters
             self._original_attn_forwards[layer_idx] = attn_module.forward
             attn_module.forward = MethodType(
                 self._make_patched_forward(layer_idx), attn_module
@@ -173,9 +178,14 @@ class HeadRepresentationExtractor:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
 
             if attn_module.config._attn_implementation == "eager" and attn_module.reorder_and_upcast_attn:
-                attn_output, attn_weights = attn_module._upcast_and_reordered_attn(
-                    query_states, key_states, value_states, attention_mask, head_mask
-                )
+                if self._upcast_accepts_head_mask:
+                    attn_output, attn_weights = attn_module._upcast_and_reordered_attn(
+                        query_states, key_states, value_states, attention_mask, head_mask
+                    )
+                else:
+                    attn_output, attn_weights = attn_module._upcast_and_reordered_attn(
+                        query_states, key_states, value_states, attention_mask
+                    )
             else:
                 attn_output, attn_weights = attention_interface(
                     attn_module,
@@ -633,7 +643,7 @@ class ProbingExperiment:
         # Linear probe
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -650,7 +660,7 @@ class ProbingExperiment:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
@@ -696,7 +706,7 @@ class ProbingExperiment:
 
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -711,7 +721,7 @@ class ProbingExperiment:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
@@ -892,7 +902,7 @@ class PairwiseDependencyProber:
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
             class_weight={0: weights[0], 1: weights[1]},
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -912,7 +922,7 @@ class PairwiseDependencyProber:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_f1 = f1_score(y_test, clf_rand.predict(X_test), zero_division=0)
 
@@ -981,7 +991,7 @@ class PairwiseDependencyProber:
 
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf.fit(X_train, y_train)
         y_pred = clf.predict(X_test)
 
@@ -997,7 +1007,7 @@ class PairwiseDependencyProber:
         np.random.shuffle(y_shuffled)
         clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
-            random_state=self.random_state, n_jobs=-1,         ))
+            random_state=self.random_state,         ))
         clf_rand.fit(X_train, y_shuffled)
         rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
 
