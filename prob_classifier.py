@@ -73,6 +73,7 @@ class HeadRepresentationExtractor:
                 self.device = torch.device("cpu")
         else:
             self.device = device
+        print(f"Using device: {self.device}", flush=True)
 
         tok_path = tokenizer_path or model_path
         self.tokenizer = AutoTokenizer.from_pretrained(tok_path)
@@ -226,7 +227,7 @@ def build_probing_dataset(
         zip(scrambled_sentences, original_sentences)
     ):
         if i % 100 == 0:
-            print(f"  Building probing data: {i}/{len(scrambled_sentences)}")
+            print(f"  Building probing data: {i}/{len(scrambled_sentences)}", flush=True)
 
         # Gold labels from original sentence
         labels = labeler.extract_labels(original)
@@ -257,7 +258,10 @@ def build_probing_dataset(
                         dataset[(l, h)]["head_idx"].append(entry["head_idx"])
 
     if skipped:
-        print(f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (alignment)")
+        print(
+            f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (alignment)",
+            flush=True,
+        )
 
     # Convert lists to arrays
     for key in dataset:
@@ -293,7 +297,7 @@ class ProbingExperiment:
         finite_mask = np.isfinite(X).all(axis=1)
         n_bad = (~finite_mask).sum()
         if n_bad:
-            print(f"    [sanitise] dropping {n_bad} rows with NaN/Inf features")
+            print(f"    [sanitise] dropping {n_bad} rows with NaN/Inf features", flush=True)
         X_c, y_c = X[finite_mask], y[finite_mask]
         if len(X_c) < 20:
             return None, None
@@ -551,7 +555,7 @@ class PairwiseDependencyProber:
         finite_mask = np.isfinite(X).all(axis=1)
         n_bad = (~finite_mask).sum()
         if n_bad:
-            print(f"    [pairwise sanitise] dropping {n_bad} rows with NaN/Inf")
+            print(f"    [pairwise sanitise] dropping {n_bad} rows with NaN/Inf", flush=True)
         X_c, y_c = X[finite_mask], y[finite_mask]
         if len(X_c) < 20:
             return None, None
@@ -744,7 +748,7 @@ def build_pairwise_dataset(
         zip(scrambled_sentences, original_sentences)
     ):
         if i % 100 == 0:
-            print(f"  Building pairwise data: {i}/{len(scrambled_sentences)}")
+            print(f"  Building pairwise data: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
         head_reps, token_ids, tokens = extractor.extract(scrambled)
@@ -764,7 +768,10 @@ def build_pairwise_dataset(
         })
 
     if skipped:
-        print(f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (pairwise alignment)")
+        print(
+            f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (pairwise alignment)",
+            flush=True,
+        )
 
     # Now build per-head pairwise datasets
     dataset = {}
@@ -892,7 +899,7 @@ def compute_pairwise_baselines(
         zip(scrambled_sentences, original_sentences)
     ):
         if i % 100 == 0:
-            print(f"  Pairwise baseline: {i}/{len(scrambled_sentences)}")
+            print(f"  Pairwise baseline: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
         inputs = extractor.tokenizer(
@@ -990,7 +997,7 @@ def compute_word_embedding_baseline(
         zip(scrambled_sentences, original_sentences)
     ):
         if i % 100 == 0:
-            print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}")
+            print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
         inputs = extractor.tokenizer(
@@ -1046,23 +1053,23 @@ def run_probing_pipeline(
     device=None,
 ):
 
-    print(f"\n{'='*60}")
-    print(f"  Probing: {model_label} ({model_path})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Probing: {model_label} ({model_path})", flush=True)
+    print(f"{'='*60}", flush=True)
 
     extractor = HeadRepresentationExtractor(
         model_path, tokenizer_path=tokenizer_path, device=device,
     )
 
     # Build dataset
-    print("\n  Building probing dataset...")
+    print("\n  Building probing dataset...", flush=True)
     dataset = build_probing_dataset(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
     )
 
     # Word-embedding baseline (token-level)
-    print("\n  Computing word-embedding baseline...")
+    print("\n  Computing word-embedding baseline...", flush=True)
     emb_baseline = compute_word_embedding_baseline(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
@@ -1081,7 +1088,7 @@ def run_probing_pipeline(
         for h in range(n_heads):
             done += 1
             if done % 24 == 0:
-                print(f"  Probing head {done}/{total}")
+                print(f"  Probing head {done}/{total}", flush=True)
 
             data = dataset[(l, h)]
             X = data["X"]
@@ -1100,14 +1107,14 @@ def run_probing_pipeline(
             }
 
     # ---- Pairwise dependency structure probing ----
-    print("\n  Building pairwise probing dataset...")
+    print("\n  Building pairwise probing dataset...", flush=True)
     pw_dataset = build_pairwise_dataset(
         extractor, labeler, scrambled_sentences, original_sentences,
         combination="concat",
         max_sentences=max_sentences,
     )
 
-    print("\n  Computing pairwise baselines...")
+    print("\n  Computing pairwise baselines...", flush=True)
     pw_baselines = compute_pairwise_baselines(
         extractor, labeler, scrambled_sentences, original_sentences,
         combination="concat",
@@ -1122,7 +1129,7 @@ def run_probing_pipeline(
         for h in range(n_heads):
             done += 1
             if done % 24 == 0:
-                print(f"  Pairwise probing head {done}/{total}")
+                print(f"  Pairwise probing head {done}/{total}", flush=True)
 
             pw_data = pw_dataset[(l, h)]
             X_pairs = pw_data["X_pairs"]
@@ -1268,28 +1275,28 @@ def validate_entropy_correlation(
 # ---------------------------------------------------------------------------
 
 def print_probing_results(results, model_label):
-    print(f"\n{'='*60}")
-    print(f"  Probing Results: {model_label}")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Probing Results: {model_label}", flush=True)
+    print(f"{'='*60}", flush=True)
 
     # Word-embedding baseline
     emb = results["word_embedding_baseline"]
-    print(f"\n  Word-Embedding Baseline:")
+    print(f"\n  Word-Embedding Baseline:", flush=True)
     if emb["pos"]:
-        print(f"    POS accuracy:     {emb['pos']['accuracy']:.3f}")
+        print(f"    POS accuracy:     {emb['pos']['accuracy']:.3f}", flush=True)
     if emb["dep_rel"]:
-        print(f"    Dep-rel accuracy: {emb['dep_rel']['accuracy']:.3f}")
+        print(f"    Dep-rel accuracy: {emb['dep_rel']['accuracy']:.3f}", flush=True)
     if emb["depth"]:
-        print(f"    Depth spearman r: {emb['depth']['spearman_r']:.3f}")
+        print(f"    Depth spearman r: {emb['depth']['spearman_r']:.3f}", flush=True)
 
     # Layer-wise summary
-    print(f"\n  Layer-wise mean accuracy / spearman_r:")
+    print(f"\n  Layer-wise mean accuracy / spearman_r:", flush=True)
     layer_summ = results["layer_summary"]
     for l in range(len(layer_summ["pos"])):
         pos_v = layer_summ["pos"][l]
         dep_v = layer_summ["dep_rel"][l]
         depth_v = layer_summ["depth"][l]
-        print(f"    Layer {l:2d}:  POS={pos_v:.3f}  Dep={dep_v:.3f}  Depth={depth_v:.3f}")
+        print(f"    Layer {l:2d}:  POS={pos_v:.3f}  Dep={dep_v:.3f}  Depth={depth_v:.3f}", flush=True)
 
     # Top heads per property (token-level)
     for prop in ["pos", "dep_rel", "depth"]:
@@ -1299,30 +1306,30 @@ def print_probing_results(results, model_label):
             if res[prop] is not None:
                 scored.append((l, h, res[prop][metric]))
         scored.sort(key=lambda x: x[2], reverse=True)
-        print(f"\n  Top-5 heads for {prop} ({metric}):")
+        print(f"\n  Top-5 heads for {prop} ({metric}):", flush=True)
         for l, h, v in scored[:5]:
-            print(f"    Layer {l}, Head {h}: {v:.3f}")
+            print(f"    Layer {l}, Head {h}: {v:.3f}", flush=True)
 
     # Pairwise results
     pw = results.get("per_head_pairwise", {})
     if pw:
         pw_baselines = results.get("pairwise_baselines", {})
-        print(f"\n  Pairwise Baselines:")
+        print(f"\n  Pairwise Baselines:", flush=True)
         if pw_baselines.get("word_emb_arc"):
-            print(f"    Word-emb arc F1:      {pw_baselines['word_emb_arc']['f1']:.3f}")
+            print(f"    Word-emb arc F1:      {pw_baselines['word_emb_arc']['f1']:.3f}", flush=True)
         if pw_baselines.get("word_emb_rel"):
-            print(f"    Word-emb rel acc:     {pw_baselines['word_emb_rel']['accuracy']:.3f}")
+            print(f"    Word-emb rel acc:     {pw_baselines['word_emb_rel']['accuracy']:.3f}", flush=True)
         if pw_baselines.get("distance_arc"):
-            print(f"    Distance arc F1:      {pw_baselines['distance_arc']['f1']:.3f}")
+            print(f"    Distance arc F1:      {pw_baselines['distance_arc']['f1']:.3f}", flush=True)
 
         pw_summary = results.get("layer_summary_pairwise", {})
         if pw_summary:
-            print(f"\n  Layer-wise pairwise (arc F1 / rel acc):")
+            print(f"\n  Layer-wise pairwise (arc F1 / rel acc):", flush=True)
             n = len(pw_summary.get("arc", []))
             for l in range(n):
                 arc_v = pw_summary["arc"][l]
                 rel_v = pw_summary["relation"][l]
-                print(f"    Layer {l:2d}:  Arc={arc_v:.3f}  Rel={rel_v:.3f}")
+                print(f"    Layer {l:2d}:  Arc={arc_v:.3f}  Rel={rel_v:.3f}", flush=True)
 
         for task, metric in [("arc", "f1"), ("relation", "accuracy")]:
             scored = []
@@ -1330,37 +1337,37 @@ def print_probing_results(results, model_label):
                 if res[task] is not None and metric in res[task]:
                     scored.append((l, h, res[task][metric]))
             scored.sort(key=lambda x: x[2], reverse=True)
-            print(f"\n  Top-5 heads for pairwise {task} ({metric}):")
+            print(f"\n  Top-5 heads for pairwise {task} ({metric}):", flush=True)
             for l, h, v in scored[:5]:
-                print(f"    Layer {l}, Head {h}: {v:.3f}")
+                print(f"    Layer {l}, Head {h}: {v:.3f}", flush=True)
 
 
 def print_divergence_results(divergence, correlations):
-    print(f"\n{'='*60}")
-    print(f"  Probing Divergence (Translator - Impossible)")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Probing Divergence (Translator - Impossible)", flush=True)
+    print(f"{'='*60}", flush=True)
     metric_names = {
         "pos": "ΔAccuracy", "dep_rel": "ΔAccuracy", "depth": "ΔSpearman_r",
         "pairwise_arc": "ΔF1", "pairwise_relation": "ΔAccuracy",
     }
     for prop, delta in divergence.items():
         metric = metric_names.get(prop, "Δmetric")
-        print(f"\n  {prop} ({metric}):")
-        print(f"    Mean:  {np.mean(delta):.4f}")
-        print(f"    Max:   {np.max(delta):.4f}")
-        print(f"    Min:   {np.min(delta):.4f}")
+        print(f"\n  {prop} ({metric}):", flush=True)
+        print(f"    Mean:  {np.mean(delta):.4f}", flush=True)
+        print(f"    Max:   {np.max(delta):.4f}", flush=True)
+        print(f"    Min:   {np.min(delta):.4f}", flush=True)
 
         # Top divergent heads
         flat = [(l, h, delta[l, h]) for l in range(delta.shape[0]) for h in range(delta.shape[1])]
         flat.sort(key=lambda x: x[2], reverse=True)
-        print(f"    Top-5 positive divergence heads:")
+        print(f"    Top-5 positive divergence heads:", flush=True)
         for l, h, v in flat[:5]:
-            print(f"      Layer {l}, Head {h}: {v:+.4f}")
+            print(f"      Layer {l}, Head {h}: {v:+.4f}", flush=True)
 
-    print(f"\n  Entropy-Probing Correlation (Eq. 7):")
+    print(f"\n  Entropy-Probing Correlation (Eq. 7):", flush=True)
     for prop, c in correlations.items():
         sig = "***" if c["significant"] else "n.s."
-        print(f"    {prop}: rho={c['rho']:.3f}, p={c['p_value']:.2e} {sig}")
+        print(f"    {prop}: rho={c['rho']:.3f}, p={c['p_value']:.2e} {sig}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1463,7 @@ if __name__ == "__main__":
     scrambled_sentences, original_sentences = load_dataset(
         args.dataset, args.max_sentences
     )
-    print(f"Loaded {len(scrambled_sentences)} sentence pairs")
+    print(f"Loaded {len(scrambled_sentences)} sentence pairs", flush=True)
 
     # Syntactic labeler
     labeler = SyntacticLabeler(args.spacy_model)
@@ -1522,7 +1529,7 @@ if __name__ == "__main__":
     # ---- Entropy correlation (if provided) ----
     correlations = {}
     if args.entropy_results:
-        print("\n  Loading entropy results for correlation analysis...")
+        print("\n  Loading entropy results for correlation analysis...", flush=True)
         with open(args.entropy_results, "r") as f:
             entropy_data = json.load(f)
 
@@ -1565,7 +1572,7 @@ if __name__ == "__main__":
     with open(args.output, "w") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\nResults saved to {args.output}")
+    print(f"\nResults saved to {args.output}", flush=True)
 
 
 # python prob_classifier.py \
