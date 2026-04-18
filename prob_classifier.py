@@ -1,5 +1,7 @@
 import argparse
 import json
+from collections import defaultdict, deque
+from types import MethodType
 
 import numpy as np
 import spacy
@@ -15,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.gpt2.modeling_gpt2 import ALL_ATTENTION_FUNCTIONS, eager_attention_forward
 
 
 # ---------------------------------------------------------------------------
@@ -93,58 +96,128 @@ class HeadRepresentationExtractor:
         self.d_head = cfg.n_embd // cfg.n_head  # 64 for GPT-2
         self.model_path = model_path
 
-        # Register hooks to capture per-head outputs
+        # Patch attention blocks to capture true per-head outputs
         self._head_outputs = {}
-        self._hooks = []
-        self._register_hooks()
+        self._original_attn_forwards = {}
+        self._patch_attention_modules()
 
-    # -- hook machinery -----------------------------------------------------
+    # -- attention patching -------------------------------------------------
 
-    def _register_hooks(self):
-        """Attach forward hooks to every attention layer to capture
-        per-head output **before** the output projection merges heads."""
+    def _patch_attention_modules(self):
+        """Patch GPT-2 attention blocks to capture outputs before c_proj mixes heads."""
         for layer_idx in range(self.n_layers):
             attn_module = self.model.transformer.h[layer_idx].attn
-            hook = attn_module.register_forward_hook(
-                self._make_hook(layer_idx)
+            self._original_attn_forwards[layer_idx] = attn_module.forward
+            attn_module.forward = MethodType(
+                self._make_patched_forward(layer_idx), attn_module
             )
-            self._hooks.append(hook)
 
-    def _make_hook(self, layer_idx: int):
-        def hook_fn(module, input, output):
-            # GPT-2 attention forward returns (attn_output, present, (attentions))
-            # attn_output shape: (batch, seq_len, n_embd)
-            attn_output = output[0]  # (1, seq, n_embd)
-            batch, seq, _ = attn_output.shape
-            # Reshape into per-head representations
-            # (1, seq, n_heads, d_head)
-            per_head = attn_output.view(batch, seq, self.n_heads, self.d_head)
-            self._head_outputs[layer_idx] = per_head.detach().cpu()
-        return hook_fn
+    def _make_patched_forward(self, layer_idx: int):
+        original_forward = self._original_attn_forwards[layer_idx]
+
+        def patched_forward(
+            attn_module,
+            hidden_states,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            output_attentions=False,
+            **kwargs,
+        ):
+            # Fall back to HF's implementation for code paths we do not use
+            # in probing extraction (for example cached decoding).
+            if encoder_hidden_states is not None or past_key_values is not None:
+                return original_forward(
+                    hidden_states,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    output_attentions=output_attentions,
+                    **kwargs,
+                )
+
+            query_states, key_states, value_states = attn_module.c_attn(hidden_states).split(
+                attn_module.split_size, dim=2
+            )
+            shape_kv = (*key_states.shape[:-1], -1, attn_module.head_dim)
+            key_states = key_states.view(shape_kv).transpose(1, 2)
+            value_states = value_states.view(shape_kv).transpose(1, 2)
+
+            shape_q = (*query_states.shape[:-1], -1, attn_module.head_dim)
+            query_states = query_states.view(shape_q).transpose(1, 2)
+
+            is_causal = attention_mask is None and query_states.shape[-2] > 1
+            attention_interface = eager_attention_forward
+            if attn_module.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_module.config._attn_implementation]
+
+            if attn_module.config._attn_implementation == "eager" and attn_module.reorder_and_upcast_attn:
+                attn_output, attn_weights = attn_module._upcast_and_reordered_attn(
+                    query_states, key_states, value_states, attention_mask, head_mask
+                )
+            else:
+                attn_output, attn_weights = attention_interface(
+                    attn_module,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    head_mask=head_mask,
+                    dropout=attn_module.attn_dropout.p if attn_module.training else 0.0,
+                    is_causal=is_causal,
+                    **kwargs,
+                )
+
+            # Save true per-head outputs before c_proj mixes head subspaces.
+            self._head_outputs[layer_idx] = attn_output.permute(0, 2, 1, 3).detach().cpu()
+
+            attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
+            attn_output = attn_module.c_proj(attn_output)
+            attn_output = attn_module.resid_dropout(attn_output)
+            return attn_output, attn_weights
+
+        return patched_forward
 
     def remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
+        for layer_idx in range(self.n_layers):
+            attn_module = self.model.transformer.h[layer_idx].attn
+            if layer_idx in self._original_attn_forwards:
+                attn_module.forward = self._original_attn_forwards[layer_idx]
+        self._original_attn_forwards.clear()
+
+    def tokenize(self, text: str):
+        encoded = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            return_offsets_mapping=True,
+        )
+        offsets = [tuple(span) for span in encoded.pop("offset_mapping")[0].tolist()]
+        input_ids = encoded["input_ids"][0].tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+        model_inputs = {k: v.to(self.device) for k, v in encoded.items()}
+        return model_inputs, input_ids, tokens, offsets
 
     # -- extraction ---------------------------------------------------------
 
     def extract(self, text: str):
 
         self._head_outputs.clear()
-        inputs = self.tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=512
-        ).to(self.device)
+        inputs, token_ids, tokens, offsets = self.tokenize(text)
 
         seq_len = inputs["input_ids"].shape[1]
         if seq_len == 0:
-            return None, [], []
+            return None, [], [], []
 
         with torch.no_grad():
             self.model(**inputs)
-
-        token_ids = inputs["input_ids"][0].tolist()
-        tokens = [self.tokenizer.decode(tid) for tid in token_ids]
 
         head_reps = {}
         for layer_idx in range(self.n_layers):
@@ -155,47 +228,82 @@ class HeadRepresentationExtractor:
                 np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                 head_reps[(layer_idx, head_idx)] = arr
 
-        return head_reps, token_ids, tokens
+        return head_reps, token_ids, tokens, offsets
 
 
 # ---------------------------------------------------------------------------
 # Subword-to-word alignment
 # ---------------------------------------------------------------------------
 
-def align_subwords_to_words(subword_tokens: list[str], word_labels: dict):
+def _token_identity(text: str) -> str:
+    return text
 
-    words = word_labels["tokens"]
+
+def _first_subword_for_span(offsets, start_char: int, end_char: int):
+    for subword_idx, (sub_start, sub_end) in enumerate(offsets):
+        if sub_end <= start_char:
+            continue
+        if sub_start >= end_char:
+            break
+        if max(sub_start, start_char) < min(sub_end, end_char):
+            return subword_idx
+    return None
+
+
+def align_scrambled_words_to_labels(
+    scrambled_sentence: str,
+    offsets,
+    labeler: SyntacticLabeler,
+    word_labels: dict,
+):
+    """Map scrambled tokens to original labels by token identity and occurrence."""
+    scrambled_doc = labeler.nlp.make_doc(scrambled_sentence)
+
+    original_occurrences = defaultdict(deque)
+    for original_idx, token_text in enumerate(word_labels["tokens"]):
+        original_occurrences[_token_identity(token_text)].append(original_idx)
+
     aligned = []
-    sw_idx = 0
+    for scrambled_idx, tok in enumerate(scrambled_doc):
+        identity = _token_identity(tok.text)
+        if not original_occurrences[identity]:
+            continue
 
-    for w_idx, word in enumerate(words):
-        # Build up the word from subword tokens
-        accumulated = ""
-        start_sw = sw_idx
-        while sw_idx < len(subword_tokens):
-            piece = subword_tokens[sw_idx].replace("Ġ", "").replace(" ", "")
-            accumulated += piece
-            sw_idx += 1
-            # Check if we've reconstructed the word (strip punctuation quirks)
-            if accumulated == word.replace(" ", ""):
-                break
-            # If accumulated is already longer than the word, alignment failed
-            if len(accumulated) > len(word) + 2:
-                # fallback: skip this word
-                sw_idx = start_sw + 1
-                break
+        original_idx = original_occurrences[identity].popleft()
+        subword_idx = _first_subword_for_span(offsets, tok.idx, tok.idx + len(tok))
+        if subword_idx is None:
+            continue
 
-        if accumulated == word.replace(" ", ""):
-            aligned.append({
-                "subword_idx": start_sw,
-                "word_idx": w_idx,              # original word position
-                "pos": word_labels["pos"][w_idx],
-                "dep_rel": word_labels["dep_rel"][w_idx],
-                "head_idx": word_labels["head_idx"][w_idx],
-                "depth": word_labels["depth"][w_idx],
-            })
+        aligned.append({
+            "subword_idx": subword_idx,
+            "scrambled_word_idx": scrambled_idx,
+            "word_idx": original_idx,
+            "token": tok.text,
+            "pos": word_labels["pos"][original_idx],
+            "dep_rel": word_labels["dep_rel"][original_idx],
+            "head_idx": word_labels["head_idx"][original_idx],
+            "depth": word_labels["depth"][original_idx],
+        })
 
     return aligned
+
+
+def build_sentence_split(n_sentences: int, test_size: float = 0.2, val_size: float = 0.1, random_state: int = 42):
+    sentence_ids = np.arange(n_sentences)
+    if n_sentences < 3:
+        return {"train": sentence_ids, "val": np.array([], dtype=int), "test": np.array([], dtype=int)}
+
+    train_ids, test_ids = train_test_split(
+        sentence_ids, test_size=test_size, random_state=random_state, shuffle=True
+    )
+    val_fraction = val_size / max(1e-8, 1.0 - test_size)
+    if len(train_ids) >= 2 and 0 < val_fraction < 1:
+        train_ids, val_ids = train_test_split(
+            train_ids, test_size=val_fraction, random_state=random_state, shuffle=True
+        )
+    else:
+        val_ids = np.array([], dtype=int)
+    return {"train": np.asarray(train_ids), "val": np.asarray(val_ids), "test": np.asarray(test_ids)}
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +325,7 @@ def build_probing_dataset(
     n_heads = extractor.n_heads
 
     dataset = {
-        (l, h): {"X": [], "pos": [], "dep_rel": [], "depth": [], "head_idx": []}
+        (l, h): {"X": [], "pos": [], "dep_rel": [], "depth": [], "head_idx": [], "sentence_id": []}
         for l in range(n_layers)
         for h in range(n_heads)
     }
@@ -233,13 +341,13 @@ def build_probing_dataset(
         labels = labeler.extract_labels(original)
 
         # Model representations from scrambled sentence
-        head_reps, token_ids, tokens = extractor.extract(scrambled)
+        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
         if head_reps is None:
             skipped += 1
             continue
 
-        # Align subwords to words
-        aligned = align_subwords_to_words(tokens, labels)
+        # Align scrambled words back to original labels by identity.
+        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
         if len(aligned) == 0:
             skipped += 1
             continue
@@ -256,6 +364,7 @@ def build_probing_dataset(
                         dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
                         dataset[(l, h)]["depth"].append(entry["depth"])
                         dataset[(l, h)]["head_idx"].append(entry["head_idx"])
+                        dataset[(l, h)]["sentence_id"].append(i)
 
     if skipped:
         print(
@@ -268,9 +377,11 @@ def build_probing_dataset(
         if len(dataset[key]["X"]) > 0:
             dataset[key]["X"] = np.stack(dataset[key]["X"])
             dataset[key]["depth"] = np.array(dataset[key]["depth"], dtype=np.float32)
+            dataset[key]["sentence_id"] = np.array(dataset[key]["sentence_id"], dtype=np.int32)
         else:
             dataset[key]["X"] = np.empty((0, extractor.d_head))
             dataset[key]["depth"] = np.empty(0)
+            dataset[key]["sentence_id"] = np.empty(0, dtype=np.int32)
 
     return dataset
 
@@ -282,14 +393,15 @@ def build_probing_dataset(
 class ProbingExperiment:
     """Train and evaluate linear probes for POS, dependency, and depth."""
 
-    def __init__(self, test_size: float = 0.2, random_state: int = 42):
+    def __init__(self, test_size: float = 0.2, random_state: int = 42, sentence_split=None):
         self.test_size = test_size
         self.random_state = random_state
+        self.sentence_split = sentence_split
 
     # -- NaN sanitiser ------------------------------------------------------
 
     @staticmethod
-    def _sanitise(X: np.ndarray, y: np.ndarray):
+    def _sanitise(X: np.ndarray, y: np.ndarray, sentence_ids: np.ndarray | None = None):
         """Drop rows where any feature is NaN or Inf.
 
         Returns (X_clean, y_clean) or (None, None) if too few rows survive.
@@ -299,18 +411,36 @@ class ProbingExperiment:
         if n_bad:
             print(f"    [sanitise] dropping {n_bad} rows with NaN/Inf features", flush=True)
         X_c, y_c = X[finite_mask], y[finite_mask]
+        sent_c = sentence_ids[finite_mask] if sentence_ids is not None else None
         if len(X_c) < 20:
-            return None, None
-        return X_c, y_c
+            return None, None, None
+        return X_c, y_c, sent_c
 
     # -- Safe split helper --------------------------------------------------
 
-    def _safe_train_test_split(self, X: np.ndarray, y: np.ndarray, n_classes: int):
+    def _safe_train_test_split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        n_classes: int,
+        sentence_ids: np.ndarray | None = None,
+    ):
         """Stratified split when possible; drops singleton classes otherwise.
 
         Returns (X_train, X_test, y_train, y_test) or None if too few samples
         remain after filtering rare classes.
         """
+        if sentence_ids is not None and self.sentence_split is not None:
+            train_mask = np.isin(sentence_ids, self.sentence_split["train"])
+            test_mask = np.isin(sentence_ids, self.sentence_split["test"])
+            if not train_mask.any() or not test_mask.any():
+                return None
+            X_train, X_test = X[train_mask], X[test_mask]
+            y_train, y_test = y[train_mask], y[test_mask]
+            if len(np.unique(y_train)) < 2 or len(y_test) == 0:
+                return None
+            return X_train, X_test, y_train, y_test
+
         class_counts = np.bincount(y)
         rare_classes = np.where(class_counts < 2)[0]
 
@@ -340,7 +470,7 @@ class ProbingExperiment:
 
     # -- POS tagging --------------------------------------------------------
 
-    def probe_pos(self, X: np.ndarray, labels: list[str]):
+    def probe_pos(self, X: np.ndarray, labels: list[str], sentence_ids: np.ndarray | None = None):
         """Linear probe for POS classification.
 
         Returns dict with accuracy, f1, and baseline scores.
@@ -351,13 +481,22 @@ class ProbingExperiment:
         le = LabelEncoder()
         y = le.fit_transform(labels)
 
-        X, y = self._sanitise(X, y)
+        X, y, sentence_ids = self._sanitise(X, y, sentence_ids)
         if X is None:
             return None
 
+        class_counts = np.bincount(y)
+        rare_classes = np.where(class_counts < 2)[0]
+        if len(rare_classes) > 0:
+            keep_mask = np.isin(y, rare_classes, invert=True)
+            X, y = X[keep_mask], y[keep_mask]
+            sentence_ids = sentence_ids[keep_mask] if sentence_ids is not None else None
+            if len(X) < 20:
+                return None
+
         n_classes = len(np.unique(y))
 
-        split = self._safe_train_test_split(X, y, n_classes)
+        split = self._safe_train_test_split(X, y, n_classes, sentence_ids)
         if split is None:
             return None
         X_train, X_test, y_train, y_test = split
@@ -398,7 +537,7 @@ class ProbingExperiment:
 
     # -- Dependency relations -----------------------------------------------
 
-    def probe_dependency(self, X: np.ndarray, labels: list[str]):
+    def probe_dependency(self, X: np.ndarray, labels: list[str], sentence_ids: np.ndarray | None = None):
         """Linear probe for dependency relation classification."""
         if len(X) < 20:
             return None
@@ -406,13 +545,22 @@ class ProbingExperiment:
         le = LabelEncoder()
         y = le.fit_transform(labels)
 
-        X, y = self._sanitise(X, y)
+        X, y, sentence_ids = self._sanitise(X, y, sentence_ids)
         if X is None:
             return None
 
+        class_counts = np.bincount(y)
+        rare_classes = np.where(class_counts < 2)[0]
+        if len(rare_classes) > 0:
+            keep_mask = np.isin(y, rare_classes, invert=True)
+            X, y = X[keep_mask], y[keep_mask]
+            sentence_ids = sentence_ids[keep_mask] if sentence_ids is not None else None
+            if len(X) < 20:
+                return None
+
         n_classes = len(np.unique(y))
 
-        split = self._safe_train_test_split(X, y, n_classes)
+        split = self._safe_train_test_split(X, y, n_classes, sentence_ids)
         if split is None:
             return None
         X_train, X_test, y_train, y_test = split
@@ -450,18 +598,26 @@ class ProbingExperiment:
 
     # -- Syntactic depth (regression) ---------------------------------------
 
-    def probe_depth(self, X: np.ndarray, depths: np.ndarray):
+    def probe_depth(self, X: np.ndarray, depths: np.ndarray, sentence_ids: np.ndarray | None = None):
         """Linear probe for syntactic depth (regression)."""
         if len(X) < 20:
             return None
 
-        X, depths = self._sanitise(X, depths)
+        X, depths, sentence_ids = self._sanitise(X, depths, sentence_ids)
         if X is None:
             return None
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, depths, test_size=self.test_size, random_state=self.random_state,
-        )
+        if sentence_ids is not None and self.sentence_split is not None:
+            train_mask = np.isin(sentence_ids, self.sentence_split["train"])
+            test_mask = np.isin(sentence_ids, self.sentence_split["test"])
+            if not train_mask.any() or not test_mask.any():
+                return None
+            X_train, X_test = X[train_mask], X[test_mask]
+            y_train, y_test = depths[train_mask], depths[test_mask]
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, depths, test_size=self.test_size, random_state=self.random_state,
+            )
 
         reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
         reg.fit(X_train, y_train)
@@ -514,12 +670,14 @@ class PairwiseDependencyProber:
         test_size: float = 0.2,
         random_state: int = 42,
         max_pairs_per_sentence: int = None,
+        sentence_split=None,
     ):
         assert combination in self.COMBINATION_METHODS
         self.combination = combination
         self.test_size = test_size
         self.random_state = random_state
         self.max_pairs_per_sentence = max_pairs_per_sentence
+        self.sentence_split = sentence_split
 
     # -- Representation combination -----------------------------------------
 
@@ -551,19 +709,20 @@ class PairwiseDependencyProber:
     # -- NaN sanitiser ------------------------------------------------------
 
     @staticmethod
-    def _sanitise(X, y):
+    def _sanitise(X, y, sentence_ids=None):
         finite_mask = np.isfinite(X).all(axis=1)
         n_bad = (~finite_mask).sum()
         if n_bad:
             print(f"    [pairwise sanitise] dropping {n_bad} rows with NaN/Inf", flush=True)
         X_c, y_c = X[finite_mask], y[finite_mask]
+        sent_c = sentence_ids[finite_mask] if sentence_ids is not None else None
         if len(X_c) < 20:
-            return None, None
-        return X_c, y_c
+            return None, None, None
+        return X_c, y_c, sent_c
 
     # -- Binary arc prediction ----------------------------------------------
 
-    def probe_arc(self, X_pairs, y_arc):
+    def probe_arc(self, X_pairs, y_arc, sentence_ids=None):
         """Binary classifier: does token i depend on token j?
 
         Returns dict with accuracy, precision, recall, F1, and baselines.
@@ -571,7 +730,7 @@ class PairwiseDependencyProber:
         if len(X_pairs) < 20:
             return None
 
-        X_pairs, y_arc = self._sanitise(X_pairs, y_arc)
+        X_pairs, y_arc, sentence_ids = self._sanitise(X_pairs, y_arc, sentence_ids)
         if X_pairs is None:
             return None
 
@@ -580,12 +739,22 @@ class PairwiseDependencyProber:
         if n_pos < 2 or n_neg < 2:
             return None
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_pairs, y_arc,
-            test_size=self.test_size,
-            random_state=self.random_state,
-            stratify=y_arc,
-        )
+        if sentence_ids is not None and self.sentence_split is not None:
+            train_mask = np.isin(sentence_ids, self.sentence_split["train"])
+            test_mask = np.isin(sentence_ids, self.sentence_split["test"])
+            if not train_mask.any() or not test_mask.any():
+                return None
+            X_train, X_test = X_pairs[train_mask], X_pairs[test_mask]
+            y_train, y_test = y_arc[train_mask], y_arc[test_mask]
+            if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+                return None
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_pairs, y_arc,
+                test_size=self.test_size,
+                random_state=self.random_state,
+                stratify=y_arc,
+            )
 
         # Class-weighted logistic regression for sparse arcs
         weights = compute_class_weight(
@@ -633,7 +802,7 @@ class PairwiseDependencyProber:
 
     # -- Relation type classification (positive pairs only) -----------------
 
-    def probe_relation(self, X_pairs, y_rel_labels):
+    def probe_relation(self, X_pairs, y_rel_labels, sentence_ids=None):
         """Multi-class classifier for dependency relation type.
 
         Trained only on positive pairs (where a dependency arc exists).
@@ -645,7 +814,7 @@ class PairwiseDependencyProber:
         le = LabelEncoder()
         y = le.fit_transform(y_rel_labels)
 
-        X_pairs, y = self._sanitise(X_pairs, y)
+        X_pairs, y, sentence_ids = self._sanitise(X_pairs, y, sentence_ids)
         if X_pairs is None:
             return None
 
@@ -659,16 +828,27 @@ class PairwiseDependencyProber:
         if len(rare) > 0:
             mask = np.isin(y, rare, invert=True)
             X_pairs, y = X_pairs[mask], y[mask]
+            sentence_ids = sentence_ids[mask] if sentence_ids is not None else None
             if len(X_pairs) < 20:
                 return None
             n_classes = len(np.unique(y))
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_pairs, y,
-            test_size=self.test_size,
-            random_state=self.random_state,
-            stratify=y,
-        )
+        if sentence_ids is not None and self.sentence_split is not None:
+            train_mask = np.isin(sentence_ids, self.sentence_split["train"])
+            test_mask = np.isin(sentence_ids, self.sentence_split["test"])
+            if not train_mask.any() or not test_mask.any():
+                return None
+            X_train, X_test = X_pairs[train_mask], X_pairs[test_mask]
+            y_train, y_test = y[train_mask], y[test_mask]
+            if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 1:
+                return None
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_pairs, y,
+                test_size=self.test_size,
+                random_state=self.random_state,
+                stratify=y,
+            )
 
         clf = make_pipeline(StandardScaler(), LogisticRegression(
             max_iter=2000, solver="lbfgs",
@@ -727,7 +907,7 @@ def build_pairwise_dataset(
         X_pairs: combined representations c_ij
         y_arc: binary arc labels
         y_rel: relation labels (for positive pairs)
-        distances: |i - j| for distance baseline
+        distances: |i - j| word distance for distance baseline
     """
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
@@ -751,12 +931,12 @@ def build_pairwise_dataset(
             print(f"  Building pairwise data: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
-        head_reps, token_ids, tokens = extractor.extract(scrambled)
+        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
         if head_reps is None:
             skipped += 1
             continue
 
-        aligned = align_subwords_to_words(tokens, labels)
+        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
         if len(aligned) < 2:  # need at least 2 tokens for pairs
             skipped += 1
             continue
@@ -765,6 +945,7 @@ def build_pairwise_dataset(
             "aligned": aligned,
             "head_reps": head_reps,
             "n_aligned": len(aligned),
+            "sentence_id": i,
         })
 
     if skipped:
@@ -782,6 +963,8 @@ def build_pairwise_dataset(
             y_rel_pos_list = []    # relation labels for positive pairs only
             X_pairs_pos_list = []  # representations for positive pairs only
             distances_list = []
+            sentence_ids_list = []
+            sentence_ids_pos_list = []
 
             for sent in sentence_data:
                 aligned = sent["aligned"]
@@ -803,47 +986,27 @@ def build_pairwise_dataset(
                         h_j = reps[sw_j]
                         c_ij = combiner.combine(h_i, h_j)
 
-                        # Gold: does token at word position idx_i depend on
-                        # word at position idx_j?
                         head_of_i = aligned[idx_i]["head_idx"]
-                        # head_idx is the word index in the original sentence
-                        # We need to check if idx_j's original word position
-                        # matches head_of_i. Since aligned preserves word order,
-                        # idx_j corresponds to the j-th aligned word.
-                        # But head_idx is the absolute index in the spaCy doc.
-                        # We need a mapping from aligned index -> original word idx.
-                        # aligned entries are in word order, so aligned[k] is the
-                        # k-th successfully aligned word. Its original word index
-                        # is implicit from the alignment loop in
-                        # align_subwords_to_words. We need that index.
-
-                        # For now, use the head_idx directly: arc exists if
-                        # aligned[idx_i].head_idx points to a word whose
-                        # subword_idx matches aligned[idx_j].subword_idx position.
-                        # This is approximate — we store original word positions
-                        # in the next step.
-
                         is_arc = 0
                         rel_label = "NO_ARC"
-
-                        # head_of_i is the original word index of i's head.
-                        # We check all aligned tokens to find if idx_j maps to
-                        # that original word.  Since we don't store original
-                        # word indices in aligned, we use a heuristic: if
-                        # head_of_i == idx_j (only correct if no words were
-                        # skipped in alignment).
-                        # This is a limitation we fix below by storing word_idx.
                         if head_of_i == aligned[idx_j].get("word_idx", idx_j):
                             is_arc = 1
                             rel_label = aligned[idx_i]["dep_rel"]
 
                         X_pairs_list.append(c_ij)
                         y_arc_list.append(is_arc)
-                        distances_list.append(abs(sw_i - sw_j))
+                        distances_list.append(
+                            abs(
+                                aligned[idx_i]["scrambled_word_idx"]
+                                - aligned[idx_j]["scrambled_word_idx"]
+                            )
+                        )
+                        sentence_ids_list.append(sent["sentence_id"])
 
                         if is_arc:
                             X_pairs_pos_list.append(c_ij)
                             y_rel_pos_list.append(rel_label)
+                            sentence_ids_pos_list.append(sent["sentence_id"])
 
             if len(X_pairs_list) > 0:
                 dataset[(l, h)] = {
@@ -852,6 +1015,8 @@ def build_pairwise_dataset(
                     "X_pairs_pos": np.stack(X_pairs_pos_list) if X_pairs_pos_list else np.empty((0, X_pairs_list[0].shape[0])),
                     "y_rel_pos": y_rel_pos_list,
                     "distances": np.array(distances_list, dtype=np.int32),
+                    "sentence_id": np.array(sentence_ids_list, dtype=np.int32),
+                    "sentence_id_pos": np.array(sentence_ids_pos_list, dtype=np.int32),
                 }
             else:
                 d_comb = extractor.d_head * (2 if combination == "concat" else
@@ -862,6 +1027,8 @@ def build_pairwise_dataset(
                     "X_pairs_pos": np.empty((0, d_comb)),
                     "y_rel_pos": [],
                     "distances": np.empty(0, dtype=np.int32),
+                    "sentence_id": np.empty(0, dtype=np.int32),
+                    "sentence_id_pos": np.empty(0, dtype=np.int32),
                 }
 
     return dataset
@@ -880,6 +1047,7 @@ def compute_pairwise_baselines(
     max_sentences: int = None,
     test_size: float = 0.2,
     random_state: int = 42,
+    sentence_split=None,
 ):
     """Word-embedding pairwise baseline and distance baseline."""
     if max_sentences:
@@ -894,6 +1062,8 @@ def compute_pairwise_baselines(
     y_rel_pos = []
     X_emb_pos = []
     distances_all = []
+    sentence_ids_all = []
+    sentence_ids_pos = []
 
     for i, (scrambled, original) in enumerate(
         zip(scrambled_sentences, original_sentences)
@@ -902,9 +1072,7 @@ def compute_pairwise_baselines(
             print(f"  Pairwise baseline: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
-        inputs = extractor.tokenizer(
-            scrambled, return_tensors="pt", truncation=True, max_length=512
-        ).to(extractor.device)
+        inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
         if inputs["input_ids"].shape[1] == 0:
             continue
@@ -912,11 +1080,7 @@ def compute_pairwise_baselines(
         with torch.no_grad():
             embeddings = wte(inputs["input_ids"])[0].cpu().numpy()
 
-        tokens = [
-            extractor.tokenizer.decode(tid)
-            for tid in inputs["input_ids"][0].tolist()
-        ]
-        aligned = align_subwords_to_words(tokens, labels)
+        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
         if len(aligned) < 2:
             continue
 
@@ -938,11 +1102,18 @@ def compute_pairwise_baselines(
 
                 X_emb_pairs.append(c_ij)
                 y_arc_all.append(is_arc)
-                distances_all.append(abs(sw_i - sw_j))
+                distances_all.append(
+                    abs(
+                        aligned[idx_i]["scrambled_word_idx"]
+                        - aligned[idx_j]["scrambled_word_idx"]
+                    )
+                )
+                sentence_ids_all.append(i)
 
                 if is_arc:
                     X_emb_pos.append(c_ij)
                     y_rel_pos.append(rel_label)
+                    sentence_ids_pos.append(i)
 
     result = {"word_emb_arc": None, "word_emb_rel": None, "distance_arc": None}
 
@@ -952,22 +1123,27 @@ def compute_pairwise_baselines(
     X_emb_pairs = np.stack(X_emb_pairs)
     y_arc_all = np.array(y_arc_all, dtype=np.int32)
     distances_all = np.array(distances_all, dtype=np.int32)
+    sentence_ids_all = np.array(sentence_ids_all, dtype=np.int32)
+    sentence_ids_pos = np.array(sentence_ids_pos, dtype=np.int32)
 
     prober = PairwiseDependencyProber(
-        combination=combination, test_size=test_size, random_state=random_state
+        combination=combination,
+        test_size=test_size,
+        random_state=random_state,
+        sentence_split=sentence_split,
     )
 
     # Word-embedding arc baseline
-    result["word_emb_arc"] = prober.probe_arc(X_emb_pairs, y_arc_all)
+    result["word_emb_arc"] = prober.probe_arc(X_emb_pairs, y_arc_all, sentence_ids_all)
 
     # Word-embedding relation baseline (positive pairs only)
     if len(X_emb_pos) >= 20:
         X_emb_pos = np.stack(X_emb_pos)
-        result["word_emb_rel"] = prober.probe_relation(X_emb_pos, y_rel_pos)
+        result["word_emb_rel"] = prober.probe_relation(X_emb_pos, y_rel_pos, sentence_ids_pos)
 
     # Distance baseline: predict arc from |i-j| alone
     dist_features = distances_all.reshape(-1, 1).astype(np.float32)
-    result["distance_arc"] = prober.probe_arc(dist_features, y_arc_all)
+    result["distance_arc"] = prober.probe_arc(dist_features, y_arc_all, sentence_ids_all)
 
     return result
 
@@ -984,13 +1160,14 @@ def compute_word_embedding_baseline(
     max_sentences: int = None,
     test_size: float = 0.2,
     random_state: int = 42,
+    sentence_split=None,
 ):
     """Train probes on word embeddings (wte) as a control baseline."""
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
 
-    X_all, pos_all, dep_all, depth_all = [], [], [], []
+    X_all, pos_all, dep_all, depth_all, sentence_ids = [], [], [], [], []
     wte = extractor.model.transformer.wte  # word token embedding layer
 
     for i, (scrambled, original) in enumerate(
@@ -1000,9 +1177,7 @@ def compute_word_embedding_baseline(
             print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}", flush=True)
 
         labels = labeler.extract_labels(original)
-        inputs = extractor.tokenizer(
-            scrambled, return_tensors="pt", truncation=True, max_length=512
-        ).to(extractor.device)
+        inputs, input_ids, tokens, offsets = extractor.tokenize(scrambled)
 
         if inputs["input_ids"].shape[1] == 0:
             continue
@@ -1010,11 +1185,7 @@ def compute_word_embedding_baseline(
         with torch.no_grad():
             embeddings = wte(inputs["input_ids"])[0].cpu().numpy()  # (seq, emb)
 
-        tokens = [
-            extractor.tokenizer.decode(tid)
-            for tid in inputs["input_ids"][0].tolist()
-        ]
-        aligned = align_subwords_to_words(tokens, labels)
+        aligned = align_scrambled_words_to_labels(scrambled, offsets, labeler, labels)
 
         for entry in aligned:
             sw_idx = entry["subword_idx"]
@@ -1023,18 +1194,24 @@ def compute_word_embedding_baseline(
                 pos_all.append(entry["pos"])
                 dep_all.append(entry["dep_rel"])
                 depth_all.append(entry["depth"])
+                sentence_ids.append(i)
 
     if len(X_all) < 20:
         return {"pos": None, "dep_rel": None, "depth": None}
 
     X_all = np.stack(X_all)
     depth_all = np.array(depth_all, dtype=np.float32)
+    sentence_ids = np.array(sentence_ids, dtype=np.int32)
 
-    prober = ProbingExperiment(test_size=test_size, random_state=random_state)
+    prober = ProbingExperiment(
+        test_size=test_size,
+        random_state=random_state,
+        sentence_split=sentence_split,
+    )
     return {
-        "pos": prober.probe_pos(X_all, pos_all),
-        "dep_rel": prober.probe_dependency(X_all, dep_all),
-        "depth": prober.probe_depth(X_all, depth_all),
+        "pos": prober.probe_pos(X_all, pos_all, sentence_ids),
+        "dep_rel": prober.probe_dependency(X_all, dep_all, sentence_ids),
+        "depth": prober.probe_depth(X_all, depth_all, sentence_ids),
     }
 
 
@@ -1051,6 +1228,7 @@ def run_probing_pipeline(
     model_label: str = "model",
     max_sentences: int = None,
     device=None,
+    sentence_split=None,
 ):
 
     print(f"\n{'='*60}", flush=True)
@@ -1073,10 +1251,11 @@ def run_probing_pipeline(
     emb_baseline = compute_word_embedding_baseline(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
+        sentence_split=sentence_split,
     )
 
     # Probe each head (token-level)
-    prober = ProbingExperiment()
+    prober = ProbingExperiment(sentence_split=sentence_split)
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
 
@@ -1096,9 +1275,9 @@ def run_probing_pipeline(
                 per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
                 continue
 
-            pos_result = prober.probe_pos(X, data["pos"])
-            dep_result = prober.probe_dependency(X, data["dep_rel"])
-            depth_result = prober.probe_depth(X, data["depth"])
+            pos_result = prober.probe_pos(X, data["pos"], data["sentence_id"])
+            dep_result = prober.probe_dependency(X, data["dep_rel"], data["sentence_id"])
+            depth_result = prober.probe_depth(X, data["depth"], data["sentence_id"])
 
             per_head[(l, h)] = {
                 "pos": pos_result,
@@ -1119,9 +1298,10 @@ def run_probing_pipeline(
         extractor, labeler, scrambled_sentences, original_sentences,
         combination="concat",
         max_sentences=max_sentences,
+        sentence_split=sentence_split,
     )
 
-    pw_prober = PairwiseDependencyProber(combination="concat")
+    pw_prober = PairwiseDependencyProber(combination="concat", sentence_split=sentence_split)
     per_head_pairwise = {}
     done = 0
 
@@ -1140,9 +1320,9 @@ def run_probing_pipeline(
                 }
                 continue
 
-            arc_result = pw_prober.probe_arc(X_pairs, pw_data["y_arc"])
+            arc_result = pw_prober.probe_arc(X_pairs, pw_data["y_arc"], pw_data["sentence_id"])
             rel_result = pw_prober.probe_relation(
-                pw_data["X_pairs_pos"], pw_data["y_rel_pos"],
+                pw_data["X_pairs_pos"], pw_data["y_rel_pos"], pw_data["sentence_id_pos"],
             )
 
             per_head_pairwise[(l, h)] = {
@@ -1366,6 +1546,9 @@ def print_divergence_results(divergence, correlations):
 
     print(f"\n  Entropy-Probing Correlation (Eq. 7):", flush=True)
     for prop, c in correlations.items():
+        if c["rho"] is None or c["p_value"] is None:
+            print(f"    {prop}: not available", flush=True)
+            continue
         sig = "***" if c["significant"] else "n.s."
         print(f"    {prop}: rho={c['rho']:.3f}, p={c['p_value']:.2e} {sig}", flush=True)
 
@@ -1464,6 +1647,7 @@ if __name__ == "__main__":
         args.dataset, args.max_sentences
     )
     print(f"Loaded {len(scrambled_sentences)} sentence pairs", flush=True)
+    sentence_split = build_sentence_split(len(scrambled_sentences))
 
     # Syntactic labeler
     labeler = SyntacticLabeler(args.spacy_model)
@@ -1478,6 +1662,7 @@ if __name__ == "__main__":
         model_label="Translator",
         max_sentences=args.max_sentences,
         device=device,
+        sentence_split=sentence_split,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -1491,6 +1676,7 @@ if __name__ == "__main__":
         model_label="Impossible",
         max_sentences=args.max_sentences,
         device=device,
+        sentence_split=sentence_split,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -1504,12 +1690,12 @@ if __name__ == "__main__":
         model_label="GPT-2 Base",
         max_sentences=args.max_sentences,
         device=device,
+        sentence_split=sentence_split,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
     # ---- Divergence analysis ----
     # Determine grid size from first model
-    sample_key = next(iter(results_translator["per_head"]))
     n_layers = max(k[0] for k in results_translator["per_head"]) + 1
     n_heads = max(k[1] for k in results_translator["per_head"]) + 1
 
@@ -1560,6 +1746,7 @@ if __name__ == "__main__":
         },
         "tokenizer": tokenizer_path,
         "n_sentences": len(scrambled_sentences),
+        "sentence_split": {k: v.tolist() for k, v in sentence_split.items()},
         "translator": _serialise_results(results_translator),
         "impossible": _serialise_results(results_impossible),
         "base": _serialise_results(results_base),
