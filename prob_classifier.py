@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 from collections import defaultdict, deque
 
@@ -15,6 +16,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -265,11 +267,13 @@ def build_probing_dataset(
     }
 
     skipped = 0
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Building probing data: {i}/{len(scrambled_sentences)}")
+    iterator = tqdm(
+        zip(scrambled_sentences, original_sentences),
+        total=len(scrambled_sentences),
+        desc="Probing dataset",
+        unit="sent",
+    )
+    for i, (scrambled, original) in enumerate(iterator):
 
         # Gold labels from original sentence
         labels = labeler.extract_labels(original)
@@ -846,11 +850,13 @@ def build_pairwise_dataset(
     sentence_data = []  # list of dicts with aligned info and head_reps
 
     skipped = 0
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Building pairwise data: {i}/{len(scrambled_sentences)}")
+    iterator = tqdm(
+        zip(scrambled_sentences, original_sentences),
+        total=len(scrambled_sentences),
+        desc="Pairwise dataset",
+        unit="sent",
+    )
+    for i, (scrambled, original) in enumerate(iterator):
 
         labels = labeler.extract_labels(original)
         head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
@@ -992,11 +998,13 @@ def compute_pairwise_baselines(
     sentence_ids_all = []
     sentence_ids_pos = []
 
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Pairwise baseline: {i}/{len(scrambled_sentences)}")
+    iterator = tqdm(
+        zip(scrambled_sentences, original_sentences),
+        total=len(scrambled_sentences),
+        desc="Pairwise baseline",
+        unit="sent",
+    )
+    for i, (scrambled, original) in enumerate(iterator):
 
         labels = labeler.extract_labels(original)
         encoded = extractor.tokenizer(
@@ -1113,11 +1121,13 @@ def compute_word_embedding_baseline(
     sent_ids_all = []
     wte = extractor.model.transformer.wte  # word token embedding layer
 
-    for i, (scrambled, original) in enumerate(
-        zip(scrambled_sentences, original_sentences)
-    ):
-        if i % 100 == 0:
-            print(f"  Word-embedding baseline: {i}/{len(scrambled_sentences)}")
+    iterator = tqdm(
+        zip(scrambled_sentences, original_sentences),
+        total=len(scrambled_sentences),
+        desc="Word-emb baseline",
+        unit="sent",
+    )
+    for i, (scrambled, original) in enumerate(iterator):
 
         labels = labeler.extract_labels(original)
         encoded = extractor.tokenizer(
@@ -1182,6 +1192,8 @@ def run_probing_pipeline(
     max_sentences: int = None,
     device=None,
     sentence_split=None,
+    pairwise_max_sentences: int = None,
+    skip_pairwise: bool = False,
 ):
 
     print(f"\n{'='*60}")
@@ -1214,59 +1226,68 @@ def run_probing_pipeline(
 
     per_head = {}
     total = n_layers * n_heads
-    done = 0
+    head_keys = [(l, h) for l in range(n_layers) for h in range(n_heads)]
 
-    for l in range(n_layers):
-        for h in range(n_heads):
-            done += 1
-            if done % 24 == 0:
-                print(f"  Probing head {done}/{total}")
+    for l, h in tqdm(head_keys, total=total, desc="Token-level heads", unit="head"):
+        data = dataset[(l, h)]
+        X = data["X"]
+        if X.shape[0] < 20:
+            per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
+            continue
 
-            data = dataset[(l, h)]
-            X = data["X"]
-            if X.shape[0] < 20:
-                per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
-                continue
+        sid = data.get("sentence_id")
+        pos_result = prober.probe_pos(X, data["pos"], sid)
+        dep_result = prober.probe_dependency(X, data["dep_rel"], sid)
+        depth_result = prober.probe_depth(X, data["depth"], sid)
 
-            sid = data.get("sentence_id")
-            pos_result = prober.probe_pos(X, data["pos"], sid)
-            dep_result = prober.probe_dependency(X, data["dep_rel"], sid)
-            depth_result = prober.probe_depth(X, data["depth"], sid)
+        per_head[(l, h)] = {
+            "pos": pos_result,
+            "dep_rel": dep_result,
+            "depth": depth_result,
+        }
 
-            per_head[(l, h)] = {
-                "pos": pos_result,
-                "dep_rel": dep_result,
-                "depth": depth_result,
-            }
+    # Free large token-level data before the pairwise stage.
+    del dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # ---- Pairwise dependency structure probing ----
-    print("\n  Building pairwise probing dataset...")
-    pw_dataset = build_pairwise_dataset(
-        extractor, labeler, scrambled_sentences, original_sentences,
-        combination="concat",
-        max_sentences=max_sentences,
-    )
-
-    print("\n  Computing pairwise baselines...")
-    pw_baselines = compute_pairwise_baselines(
-        extractor, labeler, scrambled_sentences, original_sentences,
-        combination="concat",
-        max_sentences=max_sentences,
-        sentence_split=sentence_split,
-    )
-
-    pw_prober = PairwiseDependencyProber(
-        combination="concat", sentence_split=sentence_split,
-    )
     per_head_pairwise = {}
-    done = 0
+    pw_baselines = {}
+    pairwise_budget = pairwise_max_sentences
+    if pairwise_budget is None:
+        pairwise_budget = max_sentences
 
-    for l in range(n_layers):
-        for h in range(n_heads):
-            done += 1
-            if done % 24 == 0:
-                print(f"  Pairwise probing head {done}/{total}")
+    if skip_pairwise:
+        print("\n  Skipping pairwise probing (--skip_pairwise)", flush=True)
+    else:
+        if pairwise_budget is not None and max_sentences is not None and pairwise_budget < max_sentences:
+            print(
+                f"\n  Pairwise stages limited to {pairwise_budget}/{max_sentences} sentences",
+                flush=True,
+            )
 
+        # ---- Pairwise dependency structure probing ----
+        print("\n  Building pairwise probing dataset...", flush=True)
+        pw_dataset = build_pairwise_dataset(
+            extractor, labeler, scrambled_sentences, original_sentences,
+            combination="concat",
+            max_sentences=pairwise_budget,
+        )
+
+        print("\n  Computing pairwise baselines...", flush=True)
+        pw_baselines = compute_pairwise_baselines(
+            extractor, labeler, scrambled_sentences, original_sentences,
+            combination="concat",
+            max_sentences=pairwise_budget,
+            sentence_split=sentence_split,
+        )
+
+        pw_prober = PairwiseDependencyProber(
+            combination="concat", sentence_split=sentence_split,
+        )
+
+        for l, h in tqdm(head_keys, total=total, desc="Pairwise heads", unit="head"):
             pw_data = pw_dataset[(l, h)]
             X_pairs = pw_data["X_pairs"]
 
@@ -1288,6 +1309,9 @@ def run_probing_pipeline(
                 "arc": arc_result,
                 "relation": rel_result,
             }
+
+        del pw_dataset
+        gc.collect()
 
     # Layer-wise summaries
     layer_summary = _compute_layer_summary(per_head, n_layers, n_heads)
@@ -1602,6 +1626,14 @@ def parse_args():
         "--spacy_model", type=str, default="en_core_web_sm",
         help="spaCy model for syntactic parsing (default: en_core_web_sm)",
     )
+    parser.add_argument(
+        "--pairwise_max_sentences", type=int, default=None,
+        help="Optional sentence cap for pairwise probing only. Useful to avoid OOM.",
+    )
+    parser.add_argument(
+        "--skip_pairwise", action="store_true",
+        help="Skip pairwise arc/relation probing entirely.",
+    )
     return parser.parse_args()
 
 
@@ -1635,6 +1667,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        pairwise_max_sentences=args.pairwise_max_sentences,
+        skip_pairwise=args.skip_pairwise,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -1649,6 +1683,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        pairwise_max_sentences=args.pairwise_max_sentences,
+        skip_pairwise=args.skip_pairwise,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -1663,6 +1699,8 @@ if __name__ == "__main__":
         max_sentences=args.max_sentences,
         device=device,
         sentence_split=sentence_split,
+        pairwise_max_sentences=args.pairwise_max_sentences,
+        skip_pairwise=args.skip_pairwise,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
