@@ -7,6 +7,7 @@ import numpy as np
 import spacy
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from scipy import stats
 from sklearn.metrics import (
@@ -389,6 +390,7 @@ PROBE_MAX_EPOCHS = 12
 PROBE_PATIENCE = 2
 PROBE_LR = 1e-2
 PROBE_WEIGHT_DECAY = 1e-4
+TOKEN_HEAD_CHUNK_SIZE = 24
 
 
 def _default_probe_device():
@@ -661,6 +663,442 @@ def _balanced_class_weights(y: np.ndarray, n_classes: int):
     nonzero = counts > 0
     weights[nonzero] = len(y) / (n_classes * counts[nonzero])
     return weights
+
+
+def _make_validation_indices(y_train, random_state, is_classification):
+    if len(y_train) < 100:
+        return np.arange(len(y_train)), None
+
+    stratify = None
+    if is_classification:
+        classes, counts = np.unique(y_train, return_counts=True)
+        if len(classes) > 1 and np.all(counts >= 2):
+            stratify = y_train
+
+    indices = np.arange(len(y_train))
+    try:
+        fit_idx, val_idx = train_test_split(
+            indices,
+            test_size=0.1,
+            random_state=random_state,
+            stratify=stratify,
+        )
+    except ValueError:
+        return indices, None
+
+    return np.asarray(fit_idx), np.asarray(val_idx)
+
+
+def _standardise_multihead_train_test(X_train: np.ndarray, X_test: np.ndarray):
+    mean = X_train.mean(axis=1, keepdims=True)
+    std = X_train.std(axis=1, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    X_train_std = ((X_train - mean) / std).astype(np.float32, copy=False)
+    X_test_std = ((X_test - mean) / std).astype(np.float32, copy=False)
+    return X_train_std, X_test_std
+
+
+def _evaluate_multihead_classifier_loss(W, b, X_eval_t, y_eval_t, weight_t):
+    if X_eval_t is None or y_eval_t is None or y_eval_t.numel() == 0:
+        return None
+
+    n_heads = X_eval_t.shape[0]
+    losses = torch.zeros(n_heads, device=X_eval_t.device)
+    total = 0
+    for start in range(0, y_eval_t.shape[0], PROBE_BATCH_SIZE):
+        stop = min(start + PROBE_BATCH_SIZE, y_eval_t.shape[0])
+        xb = X_eval_t[:, start:stop, :]
+        yb = y_eval_t[start:stop]
+        logits = torch.einsum("hbd,hcd->hbc", xb, W) + b[:, None, :]
+        loss = F.cross_entropy(
+            logits.permute(0, 2, 1),
+            yb.unsqueeze(0).expand(n_heads, -1),
+            reduction="none",
+            weight=weight_t,
+        )
+        losses += loss.sum(dim=1)
+        total += (stop - start)
+    return losses / max(total, 1)
+
+
+def _predict_multihead_classifier(W, b, X_test_std: np.ndarray, device):
+    X_test_t = torch.from_numpy(X_test_std).to(device)
+    preds = []
+    with torch.no_grad():
+        for start in range(0, X_test_t.shape[1], PROBE_BATCH_SIZE):
+            stop = min(start + PROBE_BATCH_SIZE, X_test_t.shape[1])
+            xb = X_test_t[:, start:stop, :]
+            logits = torch.einsum("hbd,hcd->hbc", xb, W) + b[:, None, :]
+            preds.append(logits.argmax(dim=-1).cpu().numpy())
+    return np.concatenate(preds, axis=1) if preds else np.empty((X_test_std.shape[0], 0), dtype=np.int64)
+
+
+def _fit_multihead_linear_classifier_torch(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    n_classes: int,
+    device: torch.device,
+    random_state: int,
+    class_weights: np.ndarray | None = None,
+):
+    X_train_std, X_test_std = _standardise_multihead_train_test(X_train, X_test)
+    fit_idx, val_idx = _make_validation_indices(y_train, random_state, is_classification=True)
+
+    X_fit_t = torch.from_numpy(X_train_std[:, fit_idx, :]).to(device)
+    y_fit_t = torch.from_numpy(np.asarray(y_train[fit_idx], dtype=np.int64)).to(device)
+    if val_idx is not None:
+        X_val_t = torch.from_numpy(X_train_std[:, val_idx, :]).to(device)
+        y_val_t = torch.from_numpy(np.asarray(y_train[val_idx], dtype=np.int64)).to(device)
+    else:
+        X_val_t = None
+        y_val_t = None
+
+    n_heads = X_train_std.shape[0]
+    d_head = X_train_std.shape[2]
+    torch.manual_seed(random_state)
+    W = nn.Parameter(torch.empty((n_heads, n_classes, d_head), device=device))
+    b = nn.Parameter(torch.zeros((n_heads, n_classes), device=device))
+    nn.init.xavier_uniform_(W)
+
+    optimizer = torch.optim.AdamW(
+        [W, b], lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+    weight_t = (
+        torch.tensor(class_weights, dtype=torch.float32, device=device)
+        if class_weights is not None else None
+    )
+
+    best_loss = torch.full((n_heads,), float("inf"), device=device)
+    best_W = W.detach().cpu().clone()
+    best_b = b.detach().cpu().clone()
+    patience_left = torch.full((n_heads,), PROBE_PATIENCE, dtype=torch.int64, device=device)
+    rng = np.random.default_rng(random_state)
+
+    for _ in range(PROBE_MAX_EPOCHS):
+        order = rng.permutation(len(fit_idx))
+        for start in range(0, len(order), PROBE_BATCH_SIZE):
+            idx = order[start:start + PROBE_BATCH_SIZE]
+            xb = X_fit_t[:, idx, :]
+            yb = y_fit_t[idx]
+            logits = torch.einsum("hbd,hcd->hbc", xb, W) + b[:, None, :]
+            loss = F.cross_entropy(
+                logits.permute(0, 2, 1),
+                yb.unsqueeze(0).expand(n_heads, -1),
+                weight=weight_t,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        monitor = _evaluate_multihead_classifier_loss(W, b, X_val_t, y_val_t, weight_t)
+        if monitor is None:
+            monitor = _evaluate_multihead_classifier_loss(W, b, X_fit_t, y_fit_t, weight_t)
+
+        improved = monitor < (best_loss - 1e-4)
+        if improved.any():
+            W_cpu = W.detach().cpu()
+            b_cpu = b.detach().cpu()
+            improved_cpu = improved.detach().cpu()
+            best_W[improved_cpu] = W_cpu[improved_cpu]
+            best_b[improved_cpu] = b_cpu[improved_cpu]
+            best_loss = torch.where(improved, monitor, best_loss)
+            patience_left = torch.where(
+                improved,
+                torch.full_like(patience_left, PROBE_PATIENCE),
+                patience_left - 1,
+            )
+        else:
+            patience_left -= 1
+
+        if bool((patience_left <= 0).all()):
+            break
+
+    W = best_W.to(device)
+    b = best_b.to(device)
+    return _predict_multihead_classifier(W, b, X_test_std, device)
+
+
+def _evaluate_multihead_regression_loss(W, b, X_eval_t, y_eval_t):
+    if X_eval_t is None or y_eval_t is None or y_eval_t.numel() == 0:
+        return None
+
+    n_heads = X_eval_t.shape[0]
+    losses = torch.zeros(n_heads, device=X_eval_t.device)
+    total = 0
+    for start in range(0, y_eval_t.shape[0], PROBE_BATCH_SIZE):
+        stop = min(start + PROBE_BATCH_SIZE, y_eval_t.shape[0])
+        xb = X_eval_t[:, start:stop, :]
+        yb = y_eval_t[start:stop]
+        preds = torch.einsum("hbd,hd->hb", xb, W) + b[:, None]
+        loss = (preds - yb.unsqueeze(0).expand(n_heads, -1)) ** 2
+        losses += loss.sum(dim=1)
+        total += (stop - start)
+    return losses / max(total, 1)
+
+
+def _predict_multihead_regressor(W, b, X_test_std: np.ndarray, device):
+    X_test_t = torch.from_numpy(X_test_std).to(device)
+    preds = []
+    with torch.no_grad():
+        for start in range(0, X_test_t.shape[1], PROBE_BATCH_SIZE):
+            stop = min(start + PROBE_BATCH_SIZE, X_test_t.shape[1])
+            xb = X_test_t[:, start:stop, :]
+            preds.append((torch.einsum("hbd,hd->hb", xb, W) + b[:, None]).cpu().numpy())
+    return np.concatenate(preds, axis=1) if preds else np.empty((X_test_std.shape[0], 0), dtype=np.float32)
+
+
+def _fit_multihead_linear_regressor_torch(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    device: torch.device,
+    random_state: int,
+):
+    X_train_std, X_test_std = _standardise_multihead_train_test(X_train, X_test)
+    fit_idx, val_idx = _make_validation_indices(y_train, random_state, is_classification=False)
+
+    X_fit_t = torch.from_numpy(X_train_std[:, fit_idx, :]).to(device)
+    y_fit_t = torch.from_numpy(np.asarray(y_train[fit_idx], dtype=np.float32)).to(device)
+    if val_idx is not None:
+        X_val_t = torch.from_numpy(X_train_std[:, val_idx, :]).to(device)
+        y_val_t = torch.from_numpy(np.asarray(y_train[val_idx], dtype=np.float32)).to(device)
+    else:
+        X_val_t = None
+        y_val_t = None
+
+    n_heads = X_train_std.shape[0]
+    d_head = X_train_std.shape[2]
+    torch.manual_seed(random_state)
+    W = nn.Parameter(torch.empty((n_heads, d_head), device=device))
+    b = nn.Parameter(torch.zeros((n_heads,), device=device))
+    nn.init.xavier_uniform_(W)
+
+    optimizer = torch.optim.AdamW(
+        [W, b], lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+
+    best_loss = torch.full((n_heads,), float("inf"), device=device)
+    best_W = W.detach().cpu().clone()
+    best_b = b.detach().cpu().clone()
+    patience_left = torch.full((n_heads,), PROBE_PATIENCE, dtype=torch.int64, device=device)
+    rng = np.random.default_rng(random_state)
+
+    for _ in range(PROBE_MAX_EPOCHS):
+        order = rng.permutation(len(fit_idx))
+        for start in range(0, len(order), PROBE_BATCH_SIZE):
+            idx = order[start:start + PROBE_BATCH_SIZE]
+            xb = X_fit_t[:, idx, :]
+            yb = y_fit_t[idx]
+            preds = torch.einsum("hbd,hd->hb", xb, W) + b[:, None]
+            loss = F.mse_loss(preds, yb.unsqueeze(0).expand(n_heads, -1))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        monitor = _evaluate_multihead_regression_loss(W, b, X_val_t, y_val_t)
+        if monitor is None:
+            monitor = _evaluate_multihead_regression_loss(W, b, X_fit_t, y_fit_t)
+
+        improved = monitor < (best_loss - 1e-5)
+        if improved.any():
+            W_cpu = W.detach().cpu()
+            b_cpu = b.detach().cpu()
+            improved_cpu = improved.detach().cpu()
+            best_W[improved_cpu] = W_cpu[improved_cpu]
+            best_b[improved_cpu] = b_cpu[improved_cpu]
+            best_loss = torch.where(improved, monitor, best_loss)
+            patience_left = torch.where(
+                improved,
+                torch.full_like(patience_left, PROBE_PATIENCE),
+                patience_left - 1,
+            )
+        else:
+            patience_left -= 1
+
+        if bool((patience_left <= 0).all()):
+            break
+
+    W = best_W.to(device)
+    b = best_b.to(device)
+    return _predict_multihead_regressor(W, b, X_test_std, device)
+
+
+def run_token_level_probes_batched(
+    dataset,
+    head_keys,
+    *,
+    sentence_split,
+    device,
+    random_state: int = 42,
+    test_size: float = 0.2,
+    head_chunk_size: int = TOKEN_HEAD_CHUNK_SIZE,
+):
+    """Train token-level probes for many heads together on the GPU."""
+    if not head_keys:
+        return {}
+
+    ref = dataset[head_keys[0]]
+    sentence_ids = ref.get("sentence_id")
+    if sentence_split is None or sentence_ids is None or len(sentence_ids) == 0:
+        return None
+
+    train_mask = np.isin(sentence_ids, sentence_split["train"])
+    test_mask = np.isin(sentence_ids, sentence_split["test"])
+    if not train_mask.any() or not test_mask.any():
+        return None
+
+    per_head = {
+        key: {"pos": None, "dep_rel": None, "depth": None}
+        for key in head_keys
+    }
+
+    def _iter_head_chunks(desc):
+        for start in tqdm(range(0, len(head_keys), head_chunk_size), desc=desc, unit="chunk"):
+            yield head_keys[start:start + head_chunk_size]
+
+    def _collect_chunk(chunk_keys):
+        valid_keys = []
+        arrays = []
+        expected_len = len(sentence_ids)
+        for key in chunk_keys:
+            X = dataset[key]["X"]
+            if X.shape[0] != expected_len or X.shape[0] < 20:
+                continue
+            valid_keys.append(key)
+            arrays.append(X)
+        if not valid_keys:
+            return None, None
+        return valid_keys, np.stack(arrays, axis=0)
+
+    # POS
+    le_pos = LabelEncoder()
+    y_pos = le_pos.fit_transform(ref["pos"])
+    y_pos_train = y_pos[train_mask]
+    y_pos_test = y_pos[test_mask]
+    if len(np.unique(y_pos_train)) >= 2 and len(y_pos_test) > 0:
+        n_classes = len(np.unique(y_pos))
+        random_acc = 1.0 / n_classes
+        majority_class = np.bincount(y_pos_train).argmax()
+        majority_acc = accuracy_score(y_pos_test, np.full_like(y_pos_test, majority_class))
+        y_pos_shuffled = y_pos_train.copy()
+        np.random.default_rng(random_state).shuffle(y_pos_shuffled)
+
+        for chunk_keys in _iter_head_chunks("POS head chunks"):
+            valid_keys, X_chunk = _collect_chunk(chunk_keys)
+            if X_chunk is None:
+                continue
+            X_train = X_chunk[:, train_mask, :]
+            X_test = X_chunk[:, test_mask, :]
+            y_pred = _fit_multihead_linear_classifier_torch(
+                X_train, y_pos_train, X_test,
+                n_classes=n_classes,
+                device=device,
+                random_state=random_state,
+            )
+            y_rand = _fit_multihead_linear_classifier_torch(
+                X_train, y_pos_shuffled, X_test,
+                n_classes=n_classes,
+                device=device,
+                random_state=random_state,
+            )
+            for idx, key in enumerate(valid_keys):
+                per_head[key]["pos"] = {
+                    "accuracy": float(accuracy_score(y_pos_test, y_pred[idx])),
+                    "f1_weighted": float(f1_score(y_pos_test, y_pred[idx], average="weighted", zero_division=0)),
+                    "n_classes": int(n_classes),
+                    "n_samples": int(X_chunk.shape[1]),
+                    "random_baseline": float(random_acc),
+                    "majority_baseline": float(majority_acc),
+                    "random_label_baseline": float(accuracy_score(y_pos_test, y_rand[idx])),
+                }
+
+    # Dependency relation
+    le_dep = LabelEncoder()
+    y_dep = le_dep.fit_transform(ref["dep_rel"])
+    y_dep_train = y_dep[train_mask]
+    y_dep_test = y_dep[test_mask]
+    if len(np.unique(y_dep_train)) >= 2 and len(y_dep_test) > 0:
+        n_classes = len(np.unique(y_dep))
+        random_acc = 1.0 / n_classes
+        majority_class = np.bincount(y_dep_train).argmax()
+        majority_acc = accuracy_score(y_dep_test, np.full_like(y_dep_test, majority_class))
+        y_dep_shuffled = y_dep_train.copy()
+        np.random.default_rng(random_state).shuffle(y_dep_shuffled)
+
+        for chunk_keys in _iter_head_chunks("Dep head chunks"):
+            valid_keys, X_chunk = _collect_chunk(chunk_keys)
+            if X_chunk is None:
+                continue
+            X_train = X_chunk[:, train_mask, :]
+            X_test = X_chunk[:, test_mask, :]
+            y_pred = _fit_multihead_linear_classifier_torch(
+                X_train, y_dep_train, X_test,
+                n_classes=n_classes,
+                device=device,
+                random_state=random_state,
+            )
+            y_rand = _fit_multihead_linear_classifier_torch(
+                X_train, y_dep_shuffled, X_test,
+                n_classes=n_classes,
+                device=device,
+                random_state=random_state,
+            )
+            for idx, key in enumerate(valid_keys):
+                per_head[key]["dep_rel"] = {
+                    "accuracy": float(accuracy_score(y_dep_test, y_pred[idx])),
+                    "f1_weighted": float(f1_score(y_dep_test, y_pred[idx], average="weighted", zero_division=0)),
+                    "n_classes": int(n_classes),
+                    "n_samples": int(X_chunk.shape[1]),
+                    "random_baseline": float(random_acc),
+                    "majority_baseline": float(majority_acc),
+                    "random_label_baseline": float(accuracy_score(y_dep_test, y_rand[idx])),
+                }
+
+    # Depth
+    y_depth = np.asarray(ref["depth"], dtype=np.float32)
+    y_depth_train = y_depth[train_mask]
+    y_depth_test = y_depth[test_mask]
+    y_depth_shuffled = y_depth_train.copy()
+    np.random.default_rng(random_state).shuffle(y_depth_shuffled)
+
+    for chunk_keys in _iter_head_chunks("Depth head chunks"):
+        valid_keys, X_chunk = _collect_chunk(chunk_keys)
+        if X_chunk is None:
+            continue
+        X_train = X_chunk[:, train_mask, :]
+        X_test = X_chunk[:, test_mask, :]
+        y_pred = _fit_multihead_linear_regressor_torch(
+            X_train, y_depth_train, X_test,
+            device=device,
+            random_state=random_state,
+        )
+        y_rand = _fit_multihead_linear_regressor_torch(
+            X_train, y_depth_shuffled, X_test,
+            device=device,
+            random_state=random_state,
+        )
+        mean_pred = np.full_like(y_depth_test, np.mean(y_depth_train))
+        baseline_mse = mean_squared_error(y_depth_test, mean_pred)
+
+        for idx, key in enumerate(valid_keys):
+            pred = y_pred[idx]
+            if np.std(y_depth_test) > 0 and np.std(pred) > 0:
+                spearman_r, spearman_p = stats.spearmanr(y_depth_test, pred)
+            else:
+                spearman_r, spearman_p = 0.0, 1.0
+            per_head[key]["depth"] = {
+                "mse": float(mean_squared_error(y_depth_test, pred)),
+                "spearman_r": float(spearman_r),
+                "spearman_p": float(spearman_p),
+                "n_samples": int(X_chunk.shape[1]),
+                "mean_baseline_mse": float(baseline_mse),
+                "random_label_mse": float(mean_squared_error(y_depth_test, y_rand[idx])),
+            }
+
+    return per_head
 
 
 # ---------------------------------------------------------------------------
@@ -1592,34 +2030,42 @@ def run_probing_pipeline(
     )
 
     # Probe each head (token-level)
-    prober = ProbingExperiment(
-        sentence_split=sentence_split,
-        device=extractor.device,
-    )
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
-
-    per_head = {}
     total = n_layers * n_heads
     head_keys = [(l, h) for l in range(n_layers) for h in range(n_heads)]
 
-    for l, h in tqdm(head_keys, total=total, desc="Token-level heads", unit="head"):
-        data = dataset[(l, h)]
-        X = data["X"]
-        if X.shape[0] < 20:
-            per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
-            continue
+    per_head = run_token_level_probes_batched(
+        dataset,
+        head_keys,
+        sentence_split=sentence_split,
+        device=extractor.device,
+    )
 
-        sid = data.get("sentence_id")
-        pos_result = prober.probe_pos(X, data["pos"], sid)
-        dep_result = prober.probe_dependency(X, data["dep_rel"], sid)
-        depth_result = prober.probe_depth(X, data["depth"], sid)
+    if per_head is None:
+        print("\n  Falling back to per-head token probing...", flush=True)
+        prober = ProbingExperiment(
+            sentence_split=sentence_split,
+            device=extractor.device,
+        )
+        per_head = {}
+        for l, h in tqdm(head_keys, total=total, desc="Token-level heads", unit="head"):
+            data = dataset[(l, h)]
+            X = data["X"]
+            if X.shape[0] < 20:
+                per_head[(l, h)] = {"pos": None, "dep_rel": None, "depth": None}
+                continue
 
-        per_head[(l, h)] = {
-            "pos": pos_result,
-            "dep_rel": dep_result,
-            "depth": depth_result,
-        }
+            sid = data.get("sentence_id")
+            pos_result = prober.probe_pos(X, data["pos"], sid)
+            dep_result = prober.probe_dependency(X, data["dep_rel"], sid)
+            depth_result = prober.probe_depth(X, data["depth"], sid)
+
+            per_head[(l, h)] = {
+                "pos": pos_result,
+                "dep_rel": dep_result,
+                "depth": depth_result,
+            }
 
     # Free large token-level data before the pairwise stage.
     del dataset
@@ -2166,11 +2612,12 @@ if __name__ == "__main__":
     print(f"\nResults saved to {args.output}")
 
 
-# python prob_classifier.py \
-#   --translation_model models/gutenberg-localShuffle-w3 \
-#   --impossible_model mission-impossible-lms/local-shuffle-w3-gpt2 \
-#   --base_model gpt2 \
-#   --dataset test_data/training_data_1k_gutenberg_localShuffle.json \
-#   --entropy_results entropy_impossible_results.json \
-#   --output probing_results.json \
-#   --max_sentences 200
+# python prob_classifier.py   \
+# --translation_model the-amirhosein/gutenberg-localShuffle-w3 \
+# --impossible_model mission-impossible-lms/local-shuffle-w3-gpt2 \
+# --base_model gpt2 \
+# --dataset test_data/test_data_1k_gutenberg_localShuffle3.json \
+# --entropy_results entropy_impossible_results.json \
+# --output probing_results.json \
+# --max_sentences 1000 \
+# --batch_size 32
