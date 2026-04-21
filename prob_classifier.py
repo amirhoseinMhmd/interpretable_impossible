@@ -1815,6 +1815,320 @@ def build_pairwise_dataset_for_head(
     }
 
 
+def _combine_pair_features(h_i: np.ndarray, h_j: np.ndarray, combination: str):
+    if combination == "concat":
+        return np.concatenate([h_i, h_j], axis=-1)
+    if combination == "diff":
+        return h_i - h_j
+    if combination == "product":
+        return h_i * h_j
+    return np.concatenate([h_i, h_j, h_i - h_j, h_i * h_j], axis=-1)
+
+
+def _sentence_pair_arrays(sent, layer_idx: int, head_idx: int, combination: str):
+    aligned = sent["aligned"]
+    n_tok = sent["n_aligned"]
+    d_comb = _pairwise_feature_dim(combination, sent["head_reps"][(layer_idx, head_idx)].shape[1])
+    if n_tok < 2:
+        return (
+            np.empty((0, d_comb), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            [],
+        )
+
+    reps = np.asarray(sent["head_reps"][(layer_idx, head_idx)], dtype=np.float32)
+    sw_idx = np.array([entry["subword_idx"] for entry in aligned], dtype=np.int32)
+    valid = sw_idx < reps.shape[0]
+    if valid.sum() < 2:
+        return (
+            np.empty((0, d_comb), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            [],
+        )
+
+    reps_sub = reps[sw_idx[valid]]
+    aligned_valid = [entry for entry, keep in zip(aligned, valid) if keep]
+    n_tok = len(aligned_valid)
+    if n_tok < 2:
+        return (
+            np.empty((0, d_comb), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            [],
+        )
+
+    rows, cols = np.where(~np.eye(n_tok, dtype=bool))
+    h_i = reps_sub[rows]
+    h_j = reps_sub[cols]
+    X_pairs = _combine_pair_features(h_i, h_j, combination).astype(np.float32, copy=False)
+
+    word_idx = np.array([entry["word_idx"] for entry in aligned_valid], dtype=np.int32)
+    head_idx_arr = np.array([entry["head_idx"] for entry in aligned_valid], dtype=np.int32)
+    y_arc = (head_idx_arr[rows] == word_idx[cols]).astype(np.int32)
+    dep_rels = [entry["dep_rel"] for entry in aligned_valid]
+    y_rel = [dep_rels[row] for row, is_arc in zip(rows.tolist(), y_arc.tolist()) if is_arc]
+    return X_pairs, y_arc, y_rel
+
+
+def build_positive_pairwise_dataset_for_head(
+    sentence_data,
+    layer_idx: int,
+    head_idx: int,
+    *,
+    combination: str = "concat",
+):
+    d_head = next(iter(sentence_data))["head_reps"][(layer_idx, head_idx)].shape[1] if sentence_data else 64
+    d_comb = _pairwise_feature_dim(combination, d_head)
+    X_pos_list = []
+    y_rel_pos = []
+    sentence_ids_pos = []
+
+    for sent in sentence_data:
+        X_pairs, y_arc, y_rel = _sentence_pair_arrays(sent, layer_idx, head_idx, combination)
+        if len(y_arc) == 0:
+            continue
+        pos_mask = y_arc.astype(bool)
+        if pos_mask.any():
+            X_pos = X_pairs[pos_mask].astype(PAIRWISE_FEATURE_DTYPE, copy=False)
+            X_pos_list.append(X_pos)
+            y_rel_pos.extend(y_rel)
+            sentence_ids_pos.extend([sent["sentence_id"]] * len(y_rel))
+
+    if not X_pos_list:
+        return {
+            "X_pairs_pos": np.empty((0, d_comb), dtype=PAIRWISE_FEATURE_DTYPE),
+            "y_rel_pos": [],
+            "sentence_id_pos": np.empty(0, dtype=np.int32),
+        }
+
+    return {
+        "X_pairs_pos": np.concatenate(X_pos_list, axis=0),
+        "y_rel_pos": y_rel_pos,
+        "sentence_id_pos": np.array(sentence_ids_pos, dtype=np.int32),
+    }
+
+
+def probe_arc_streaming_for_head(
+    sentence_data,
+    layer_idx: int,
+    head_idx: int,
+    *,
+    combination: str,
+    sentence_split,
+    device,
+    random_state: int = 42,
+):
+    available_train = [
+        sent for sent in sentence_data
+        if sent["sentence_id"] in set(sentence_split["train"])
+    ]
+    available_test = [
+        sent for sent in sentence_data
+        if sent["sentence_id"] in set(sentence_split["test"])
+    ]
+    if not available_train or not available_test:
+        return None
+
+    train_sentence_ids = np.array([sent["sentence_id"] for sent in available_train], dtype=np.int32)
+    fit_ids = train_sentence_ids
+    val_ids = None
+    if len(train_sentence_ids) >= 10:
+        fit_ids, val_ids = train_test_split(
+            train_sentence_ids,
+            test_size=0.1,
+            random_state=random_state,
+            shuffle=True,
+        )
+    fit_id_set = set(np.asarray(fit_ids).tolist())
+    val_id_set = set(np.asarray(val_ids).tolist()) if val_ids is not None else None
+
+    fit_sents = [sent for sent in available_train if sent["sentence_id"] in fit_id_set]
+    val_sents = (
+        [sent for sent in available_train if sent["sentence_id"] in val_id_set]
+        if val_id_set is not None else None
+    )
+
+    def _iter_arc_batches(sentences, *, shuffle=False, shuffle_labels=False):
+        rng = np.random.default_rng(random_state)
+        order = np.arange(len(sentences))
+        if shuffle:
+            rng.shuffle(order)
+        for idx in order:
+            X_pairs, y_arc, _ = _sentence_pair_arrays(
+                sentences[idx], layer_idx, head_idx, combination,
+            )
+            if len(y_arc) == 0:
+                continue
+            if shuffle_labels:
+                y_arc = y_arc.copy()
+                rng.shuffle(y_arc)
+            for start in range(0, len(y_arc), PROBE_BATCH_SIZE):
+                stop = min(start + PROBE_BATCH_SIZE, len(y_arc))
+                yield X_pairs[start:stop], y_arc[start:stop]
+
+    n_train = 0
+    n_positive = 0
+    for _, y_batch in _iter_arc_batches(fit_sents):
+        n_train += len(y_batch)
+        n_positive += int(y_batch.sum())
+    n_negative = n_train - n_positive
+    if n_train < 20 or n_positive < 2 or n_negative < 2:
+        return None
+
+    d_comb = _pairwise_feature_dim(
+        combination,
+        next(iter(sentence_data))["head_reps"][(layer_idx, head_idx)].shape[1],
+    )
+    weight_vec = _balanced_class_weights(
+        np.concatenate([
+            np.ones(n_positive, dtype=np.int32),
+            np.zeros(n_negative, dtype=np.int32),
+        ]),
+        2,
+    )
+    criterion = nn.CrossEntropyLoss(
+        weight=torch.tensor(weight_vec, dtype=torch.float32, device=device),
+    )
+    torch.manual_seed(random_state)
+    model = nn.Linear(d_comb, 2).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+
+    best_state = None
+    best_loss = float("inf")
+    patience_left = PROBE_PATIENCE
+
+    def _eval_loss(sentences, *, shuffle_labels=False):
+        losses = []
+        total = 0
+        with torch.no_grad():
+            for xb_np, yb_np in _iter_arc_batches(sentences, shuffle=False, shuffle_labels=shuffle_labels):
+                xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+                yb = torch.from_numpy(yb_np.astype(np.int64, copy=False)).to(device)
+                logits = model(xb)
+                losses.append(float(criterion(logits, yb).detach().cpu()) * len(yb_np))
+                total += len(yb_np)
+        return (sum(losses) / total) if total else None
+
+    for _ in range(PROBE_MAX_EPOCHS):
+        model.train()
+        for xb_np, yb_np in _iter_arc_batches(fit_sents, shuffle=True):
+            xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+            yb = torch.from_numpy(yb_np.astype(np.int64, copy=False)).to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        monitor = _eval_loss(val_sents if val_sents else fit_sents)
+        if monitor is None:
+            break
+        if monitor < best_loss - 1e-4:
+            best_loss = monitor
+            best_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in model.state_dict().items()
+            }
+            patience_left = PROBE_PATIENCE
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    y_true = []
+    y_pred = []
+    with torch.no_grad():
+        model.eval()
+        for xb_np, yb_np in _iter_arc_batches(available_test):
+            xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+            logits = model(xb)
+            pred = logits.argmax(dim=1).cpu().numpy()
+            y_true.append(yb_np)
+            y_pred.append(pred)
+    if not y_true:
+        return None
+    y_true = np.concatenate(y_true)
+    y_pred = np.concatenate(y_pred)
+
+    # Random-label baseline via shuffled training labels in the same streaming setup.
+    rand_model = nn.Linear(d_comb, 2).to(device)
+    rand_optimizer = torch.optim.AdamW(
+        rand_model.parameters(), lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+    best_state = None
+    best_loss = float("inf")
+    patience_left = PROBE_PATIENCE
+
+    def _eval_rand_loss(sentences):
+        losses = []
+        total = 0
+        with torch.no_grad():
+            for xb_np, yb_np in _iter_arc_batches(sentences, shuffle=False, shuffle_labels=True):
+                xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+                yb = torch.from_numpy(yb_np.astype(np.int64, copy=False)).to(device)
+                logits = rand_model(xb)
+                losses.append(float(criterion(logits, yb).detach().cpu()) * len(yb_np))
+                total += len(yb_np)
+        return (sum(losses) / total) if total else None
+
+    for _ in range(PROBE_MAX_EPOCHS):
+        rand_model.train()
+        for xb_np, yb_np in _iter_arc_batches(fit_sents, shuffle=True, shuffle_labels=True):
+            xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+            yb = torch.from_numpy(yb_np.astype(np.int64, copy=False)).to(device)
+            rand_optimizer.zero_grad(set_to_none=True)
+            loss = criterion(rand_model(xb), yb)
+            loss.backward()
+            rand_optimizer.step()
+
+        monitor = _eval_rand_loss(val_sents if val_sents else fit_sents)
+        if monitor is None:
+            break
+        if monitor < best_loss - 1e-4:
+            best_loss = monitor
+            best_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in rand_model.state_dict().items()
+            }
+            patience_left = PROBE_PATIENCE
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        rand_model.load_state_dict(best_state)
+
+    y_rand = []
+    with torch.no_grad():
+        rand_model.eval()
+        for xb_np, _ in _iter_arc_batches(available_test):
+            xb = torch.from_numpy(xb_np.astype(np.float32, copy=False)).to(device)
+            y_rand.append(rand_model(xb).argmax(dim=1).cpu().numpy())
+    y_rand = np.concatenate(y_rand) if y_rand else np.empty(0, dtype=np.int64)
+
+    n_test = len(y_true)
+    n_test_pos = int(y_true.sum())
+    random_acc = (n_test_pos / n_test) if n_test > 0 else 0.0
+    majority_acc = max(n_test_pos, n_test - n_test_pos) / n_test if n_test > 0 else 0.0
+
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "n_pairs": int(n_test),
+        "n_positive": int(n_test_pos),
+        "positive_rate": float(np.mean(y_true)) if n_test > 0 else 0.0,
+        "random_baseline_acc": float(random_acc),
+        "majority_baseline_acc": float(majority_acc),
+        "random_label_f1": float(f1_score(y_true, y_rand, zero_division=0)) if len(y_rand) else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pairwise baselines
 # ---------------------------------------------------------------------------
@@ -2155,28 +2469,23 @@ def run_probing_pipeline(
             )
 
             for l, h in chunk_keys:
-                pw_data = build_pairwise_dataset_for_head(
+                arc_result = probe_arc_streaming_for_head(
                     pairwise_sentence_data,
                     l,
                     h,
                     combination="concat",
-                    d_head=extractor.d_head,
+                    sentence_split=sentence_split,
+                    device=extractor.device,
                 )
-                X_pairs = pw_data["X_pairs"]
-
-                if X_pairs.shape[0] < 20:
-                    per_head_pairwise[(l, h)] = {
-                        "arc": None, "relation": None,
-                    }
-                    del pw_data
-                    continue
-
-                arc_result = pw_prober.probe_arc(
-                    X_pairs, pw_data["y_arc"], pw_data.get("sentence_id"),
+                pw_pos = build_positive_pairwise_dataset_for_head(
+                    pairwise_sentence_data,
+                    l,
+                    h,
+                    combination="concat",
                 )
                 rel_result = pw_prober.probe_relation(
-                    pw_data["X_pairs_pos"], pw_data["y_rel_pos"],
-                    pw_data.get("sentence_id_pos"),
+                    pw_pos["X_pairs_pos"], pw_pos["y_rel_pos"],
+                    pw_pos.get("sentence_id_pos"),
                 )
 
                 per_head_pairwise[(l, h)] = {
@@ -2184,7 +2493,7 @@ def run_probing_pipeline(
                     "relation": rel_result,
                 }
 
-                del pw_data
+                del pw_pos
 
             del pairwise_sentence_data
             gc.collect()
