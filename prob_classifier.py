@@ -6,16 +6,15 @@ from collections import defaultdict, deque
 import numpy as np
 import spacy
 import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from scipy import stats
-from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
     accuracy_score, f1_score, mean_squared_error,
     precision_score, recall_score,
 )
-from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -326,6 +325,289 @@ def build_probing_dataset(
 
 
 # ---------------------------------------------------------------------------
+# PyTorch linear probes
+# ---------------------------------------------------------------------------
+
+PROBE_BATCH_SIZE = 4096
+PROBE_MAX_EPOCHS = 12
+PROBE_PATIENCE = 2
+PROBE_LR = 1e-2
+PROBE_WEIGHT_DECAY = 1e-4
+
+
+def _default_probe_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _standardise_train_test(X_train: np.ndarray, X_test: np.ndarray):
+    mean = X_train.mean(axis=0, keepdims=True)
+    std = X_train.std(axis=0, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    X_train_std = ((X_train - mean) / std).astype(np.float32, copy=False)
+    X_test_std = ((X_test - mean) / std).astype(np.float32, copy=False)
+    return X_train_std, X_test_std
+
+
+def _make_validation_split(X_train, y_train, random_state, is_classification):
+    if len(X_train) < 100:
+        return X_train, None, y_train, None
+
+    stratify = None
+    if is_classification:
+        classes, counts = np.unique(y_train, return_counts=True)
+        if len(classes) > 1 and np.all(counts >= 2):
+            stratify = y_train
+
+    try:
+        X_fit, X_val, y_fit, y_val = train_test_split(
+            X_train,
+            y_train,
+            test_size=0.1,
+            random_state=random_state,
+            stratify=stratify,
+        )
+    except ValueError:
+        return X_train, None, y_train, None
+
+    return X_fit, X_val, y_fit, y_val
+
+
+def _build_loader(X, y, batch_size, shuffle, random_state, is_classification):
+    x_tensor = torch.from_numpy(np.asarray(X, dtype=np.float32))
+    if is_classification:
+        y_tensor = torch.from_numpy(np.asarray(y, dtype=np.int64))
+    else:
+        y_tensor = torch.from_numpy(np.asarray(y, dtype=np.float32))
+
+    dataset = TensorDataset(x_tensor, y_tensor)
+    generator = torch.Generator().manual_seed(random_state)
+    return DataLoader(
+        dataset,
+        batch_size=min(batch_size, len(dataset)),
+        shuffle=shuffle,
+        generator=generator if shuffle else None,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def _evaluate_classifier_loss(model, X_val, y_val, criterion, device):
+    if X_val is None or y_val is None or len(X_val) == 0:
+        return None
+
+    loader = _build_loader(
+        X_val, y_val, batch_size=PROBE_BATCH_SIZE, shuffle=False,
+        random_state=0, is_classification=True,
+    )
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
+            logits = model(xb)
+            losses.append(float(criterion(logits, yb).detach().cpu()))
+    return float(np.mean(losses)) if losses else None
+
+
+def _evaluate_regression_loss(model, X_val, y_val, criterion, device):
+    if X_val is None or y_val is None or len(X_val) == 0:
+        return None
+
+    loader = _build_loader(
+        X_val, y_val, batch_size=PROBE_BATCH_SIZE, shuffle=False,
+        random_state=0, is_classification=False,
+    )
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
+            preds = model(xb).squeeze(-1)
+            losses.append(float(criterion(preds, yb).detach().cpu()))
+    return float(np.mean(losses)) if losses else None
+
+
+def _predict_classifier(model, X_test, device):
+    loader = _build_loader(
+        X_test,
+        np.zeros(len(X_test), dtype=np.int64),
+        batch_size=PROBE_BATCH_SIZE,
+        shuffle=False,
+        random_state=0,
+        is_classification=True,
+    )
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for xb, _ in loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            logits = model(xb)
+            preds.append(logits.argmax(dim=1).cpu().numpy())
+    return np.concatenate(preds, axis=0) if preds else np.empty(0, dtype=np.int64)
+
+
+def _predict_regression(model, X_test, device):
+    loader = _build_loader(
+        X_test,
+        np.zeros(len(X_test), dtype=np.float32),
+        batch_size=PROBE_BATCH_SIZE,
+        shuffle=False,
+        random_state=0,
+        is_classification=False,
+    )
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for xb, _ in loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            preds.append(model(xb).squeeze(-1).cpu().numpy())
+    return np.concatenate(preds, axis=0) if preds else np.empty(0, dtype=np.float32)
+
+
+def _fit_linear_classifier_torch(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    n_classes: int,
+    device: torch.device,
+    random_state: int,
+    class_weights: np.ndarray | None = None,
+):
+    X_train_std, X_test_std = _standardise_train_test(X_train, X_test)
+    X_fit, X_val, y_fit, y_val = _make_validation_split(
+        X_train_std, y_train, random_state, is_classification=True,
+    )
+
+    torch.manual_seed(random_state)
+    model = nn.Linear(X_train_std.shape[1], n_classes).to(device)
+    criterion = nn.CrossEntropyLoss(
+        weight=(
+            torch.tensor(class_weights, dtype=torch.float32, device=device)
+            if class_weights is not None else None
+        )
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+
+    train_loader = _build_loader(
+        X_fit, y_fit, batch_size=PROBE_BATCH_SIZE, shuffle=True,
+        random_state=random_state, is_classification=True,
+    )
+
+    best_state = None
+    best_loss = float("inf")
+    patience_left = PROBE_PATIENCE
+
+    for epoch in range(PROBE_MAX_EPOCHS):
+        model.train()
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        monitor = _evaluate_classifier_loss(model, X_val, y_val, criterion, device)
+        if monitor is None:
+            monitor = _evaluate_classifier_loss(model, X_fit, y_fit, criterion, device)
+
+        if monitor < best_loss - 1e-4:
+            best_loss = monitor
+            best_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in model.state_dict().items()
+            }
+            patience_left = PROBE_PATIENCE
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return _predict_classifier(model, X_test_std, device)
+
+
+def _fit_linear_regressor_torch(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    device: torch.device,
+    random_state: int,
+):
+    X_train_std, X_test_std = _standardise_train_test(X_train, X_test)
+    X_fit, X_val, y_fit, y_val = _make_validation_split(
+        X_train_std, y_train, random_state, is_classification=False,
+    )
+
+    torch.manual_seed(random_state)
+    model = nn.Linear(X_train_std.shape[1], 1).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=PROBE_LR, weight_decay=PROBE_WEIGHT_DECAY,
+    )
+
+    train_loader = _build_loader(
+        X_fit, y_fit, batch_size=PROBE_BATCH_SIZE, shuffle=True,
+        random_state=random_state, is_classification=False,
+    )
+
+    best_state = None
+    best_loss = float("inf")
+    patience_left = PROBE_PATIENCE
+
+    for epoch in range(PROBE_MAX_EPOCHS):
+        model.train()
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
+            optimizer.zero_grad(set_to_none=True)
+            preds = model(xb).squeeze(-1)
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
+
+        monitor = _evaluate_regression_loss(model, X_val, y_val, criterion, device)
+        if monitor is None:
+            monitor = _evaluate_regression_loss(model, X_fit, y_fit, criterion, device)
+
+        if monitor < best_loss - 1e-5:
+            best_loss = monitor
+            best_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in model.state_dict().items()
+            }
+            patience_left = PROBE_PATIENCE
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return _predict_regression(model, X_test_std, device)
+
+
+def _balanced_class_weights(y: np.ndarray, n_classes: int):
+    counts = np.bincount(y, minlength=n_classes).astype(np.float32)
+    weights = np.ones(n_classes, dtype=np.float32)
+    nonzero = counts > 0
+    weights[nonzero] = len(y) / (n_classes * counts[nonzero])
+    return weights
+
+
+# ---------------------------------------------------------------------------
 # Probing classifiers
 # ---------------------------------------------------------------------------
 
@@ -333,7 +615,7 @@ class ProbingExperiment:
     """Train and evaluate linear probes for POS, dependency, and depth."""
 
     def __init__(self, test_size: float = 0.2, random_state: int = 42,
-                 sentence_split=None):
+                 sentence_split=None, device=None):
         self.test_size = test_size
         self.random_state = random_state
         # If provided, train/test is done at the SENTENCE level so tokens from
@@ -341,6 +623,7 @@ class ProbingExperiment:
         # probes.tex §3.3: "the same train/test split as the main translation
         # experiments".
         self.sentence_split = sentence_split
+        self.device = device or _default_probe_device()
 
     # -- NaN sanitiser ------------------------------------------------------
 
@@ -432,12 +715,14 @@ class ProbingExperiment:
             return None
         X_train, X_test, y_train, y_test = split
 
-        # Linear probe
-        clf = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
+        y_pred = _fit_linear_classifier_torch(
+            X_train,
+            y_train,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
 
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
@@ -450,11 +735,15 @@ class ProbingExperiment:
         # Random label baseline
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf_rand.fit(X_train, y_shuffled)
-        rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
+        y_rand = _fit_linear_classifier_torch(
+            X_train,
+            y_shuffled,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
+        rand_label_acc = accuracy_score(y_test, y_rand)
 
         return {
             "accuracy": float(acc),
@@ -488,11 +777,14 @@ class ProbingExperiment:
             return None
         X_train, X_test, y_train, y_test = split
 
-        clf = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
+        y_pred = _fit_linear_classifier_torch(
+            X_train,
+            y_train,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
 
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
@@ -503,11 +795,15 @@ class ProbingExperiment:
 
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf_rand.fit(X_train, y_shuffled)
-        rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
+        y_rand = _fit_linear_classifier_torch(
+            X_train,
+            y_shuffled,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
+        rand_label_acc = accuracy_score(y_test, y_rand)
 
         return {
             "accuracy": float(acc),
@@ -544,9 +840,13 @@ class ProbingExperiment:
                 random_state=self.random_state,
             )
 
-        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
-        reg.fit(X_train, y_train)
-        y_pred = reg.predict(X_test)
+        y_pred = _fit_linear_regressor_torch(
+            X_train,
+            y_train,
+            X_test,
+            device=self.device,
+            random_state=self.random_state,
+        )
 
         mse = mean_squared_error(y_test, y_pred)
         # Spearman correlation for ordinal depth
@@ -562,9 +862,14 @@ class ProbingExperiment:
         # Random label baseline
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        reg_rand = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
-        reg_rand.fit(X_train, y_shuffled)
-        rand_mse = mean_squared_error(y_test, reg_rand.predict(X_test))
+        y_rand = _fit_linear_regressor_torch(
+            X_train,
+            y_shuffled,
+            X_test,
+            device=self.device,
+            random_state=self.random_state,
+        )
+        rand_mse = mean_squared_error(y_test, y_rand)
 
         return {
             "mse": float(mse),
@@ -596,6 +901,7 @@ class PairwiseDependencyProber:
         random_state: int = 42,
         max_pairs_per_sentence: int = None,
         sentence_split=None,
+        device=None,
     ):
         assert combination in self.COMBINATION_METHODS
         self.combination = combination
@@ -603,6 +909,7 @@ class PairwiseDependencyProber:
         self.random_state = random_state
         self.max_pairs_per_sentence = max_pairs_per_sentence
         self.sentence_split = sentence_split
+        self.device = device or _default_probe_device()
 
     # -- Representation combination -----------------------------------------
 
@@ -681,16 +988,16 @@ class PairwiseDependencyProber:
                 stratify=y_arc,
             )
 
-        # Class-weighted logistic regression for sparse arcs
-        weights = compute_class_weight(
-            "balanced", classes=np.array([0, 1]), y=y_train,
+        weights = _balanced_class_weights(y_train, 2)
+        y_pred = _fit_linear_classifier_torch(
+            X_train,
+            y_train,
+            X_test,
+            n_classes=2,
+            device=self.device,
+            random_state=self.random_state,
+            class_weights=weights,
         )
-        clf = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            class_weight={0: weights[0], 1: weights[1]},
-            random_state=self.random_state,         ))
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
 
         acc = accuracy_score(y_test, y_pred)
         prec = precision_score(y_test, y_pred, zero_division=0)
@@ -706,11 +1013,15 @@ class PairwiseDependencyProber:
         # Random label baseline
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf_rand.fit(X_train, y_shuffled)
-        rand_f1 = f1_score(y_test, clf_rand.predict(X_test), zero_division=0)
+        y_rand = _fit_linear_classifier_torch(
+            X_train,
+            y_shuffled,
+            X_test,
+            n_classes=2,
+            device=self.device,
+            random_state=self.random_state,
+        )
+        rand_f1 = f1_score(y_test, y_rand, zero_division=0)
 
         return {
             "accuracy": float(acc),
@@ -776,11 +1087,14 @@ class PairwiseDependencyProber:
                 stratify=y,
             )
 
-        clf = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
+        y_pred = _fit_linear_classifier_torch(
+            X_train,
+            y_train,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
 
         acc = accuracy_score(y_test, y_pred)
         f1_macro = f1_score(y_test, y_pred, average="macro", zero_division=0)
@@ -792,11 +1106,15 @@ class PairwiseDependencyProber:
 
         y_shuffled = y_train.copy()
         np.random.shuffle(y_shuffled)
-        clf_rand = make_pipeline(StandardScaler(), LogisticRegression(
-            max_iter=2000, solver="lbfgs",
-            random_state=self.random_state,         ))
-        clf_rand.fit(X_train, y_shuffled)
-        rand_label_acc = accuracy_score(y_test, clf_rand.predict(X_test))
+        y_rand = _fit_linear_classifier_torch(
+            X_train,
+            y_shuffled,
+            X_test,
+            n_classes=n_classes,
+            device=self.device,
+            random_state=self.random_state,
+        )
+        rand_label_acc = accuracy_score(y_test, y_rand)
 
         return {
             "accuracy": float(acc),
@@ -1075,6 +1393,7 @@ def compute_pairwise_baselines(
         test_size=test_size,
         random_state=random_state,
         sentence_split=sentence_split,
+        device=extractor.device,
     )
 
     # Word-embedding arc baseline
@@ -1170,6 +1489,7 @@ def compute_word_embedding_baseline(
         test_size=test_size,
         random_state=random_state,
         sentence_split=sentence_split,
+        device=extractor.device,
     )
     return {
         "pos": prober.probe_pos(X_all, pos_all, sent_ids_all),
@@ -1220,7 +1540,10 @@ def run_probing_pipeline(
     )
 
     # Probe each head (token-level)
-    prober = ProbingExperiment(sentence_split=sentence_split)
+    prober = ProbingExperiment(
+        sentence_split=sentence_split,
+        device=extractor.device,
+    )
     n_layers = extractor.n_layers
     n_heads = extractor.n_heads
 
@@ -1284,7 +1607,9 @@ def run_probing_pipeline(
         )
 
         pw_prober = PairwiseDependencyProber(
-            combination="concat", sentence_split=sentence_split,
+            combination="concat",
+            sentence_split=sentence_split,
+            device=extractor.device,
         )
 
         for l, h in tqdm(head_keys, total=total, desc="Pairwise heads", unit="head"):
