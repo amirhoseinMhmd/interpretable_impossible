@@ -1498,6 +1498,8 @@ class PairwiseDependencyProber:
         if n_classes < 2:
             return None
 
+        kept_class_ids = np.unique(y)
+
         # Drop singleton classes for stratified split
         class_counts = np.bincount(y)
         rare = np.where(class_counts < 2)[0]
@@ -1508,7 +1510,12 @@ class PairwiseDependencyProber:
                 sentence_ids = sentence_ids[mask]
             if len(X_pairs) < 20:
                 return None
-            n_classes = len(np.unique(y))
+            kept_class_ids = np.unique(y)
+            remap = {old: new for new, old in enumerate(kept_class_ids.tolist())}
+            y = np.array([remap[int(label)] for label in y], dtype=np.int64)
+            n_classes = len(kept_class_ids)
+        else:
+            kept_class_ids = np.unique(y)
 
         if self.sentence_split is not None and sentence_ids is not None:
             train_mask = np.isin(sentence_ids, self.sentence_split["train"])
@@ -1562,7 +1569,7 @@ class PairwiseDependencyProber:
             "f1_weighted": float(f1_weighted),
             "n_classes": n_classes,
             "n_samples": len(X_pairs),
-            "classes": le.inverse_transform(np.unique(y)).tolist(),
+            "classes": le.inverse_transform(kept_class_ids).tolist(),
             "random_baseline": float(random_acc),
             "majority_baseline": float(majority_acc),
             "random_label_baseline": float(rand_label_acc),
