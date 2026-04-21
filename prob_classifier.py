@@ -391,6 +391,8 @@ PROBE_PATIENCE = 2
 PROBE_LR = 1e-2
 PROBE_WEIGHT_DECAY = 1e-4
 TOKEN_HEAD_CHUNK_SIZE = 24
+PAIRWISE_HEAD_CHUNK_SIZE = 12
+PAIRWISE_FEATURE_DTYPE = np.float16
 
 
 def _default_probe_device():
@@ -1643,6 +1645,7 @@ def collect_pairwise_sentence_data(
     original_sentences: list[str],
     max_sentences: int = None,
     batch_size: int = 8,
+    head_keys=None,
 ):
     """Cache aligned sentence-level data for pairwise probing.
 
@@ -1657,6 +1660,7 @@ def collect_pairwise_sentence_data(
 
     sentence_data = []
     skipped = 0
+    head_key_set = set(head_keys) if head_keys is not None else None
     progress = tqdm(
         total=len(scrambled_sentences),
         desc="Pairwise sentence cache",
@@ -1676,6 +1680,11 @@ def collect_pairwise_sentence_data(
             if head_reps is None:
                 skipped += 1
                 continue
+            if head_key_set is not None:
+                head_reps = {
+                    key: np.asarray(head_reps[key], dtype=PAIRWISE_FEATURE_DTYPE)
+                    for key in head_key_set
+                }
 
             aligned = align_scrambled_to_original_by_identity(
                 scrambled, offsets, labeler, labels,
@@ -1713,14 +1722,39 @@ def build_pairwise_dataset_for_head(
 ):
     """Materialise one head's pairwise dataset from cached sentence data."""
     combiner = PairwiseDependencyProber(combination=combination)
-    X_pairs_list = []
-    y_arc_list = []
-    y_rel_pos_list = []
-    X_pairs_pos_list = []
-    distances_list = []
-    sentence_ids_list = []
-    sentence_ids_pos_list = []
+    d_comb = _pairwise_feature_dim(combination, d_head)
+    total_pairs = 0
+    total_pos_pairs = 0
+    for sent in sentence_data:
+        aligned = sent["aligned"]
+        n_tok = sent["n_aligned"]
+        total_pairs += n_tok * (n_tok - 1)
+        aligned_word_indices = {entry["word_idx"] for entry in aligned}
+        for entry in aligned:
+            if entry["head_idx"] in aligned_word_indices and entry["head_idx"] != entry["word_idx"]:
+                total_pos_pairs += 1
 
+    if total_pairs == 0:
+        return {
+            "X_pairs": np.empty((0, d_comb), dtype=PAIRWISE_FEATURE_DTYPE),
+            "y_arc": np.empty(0, dtype=np.int32),
+            "X_pairs_pos": np.empty((0, d_comb), dtype=PAIRWISE_FEATURE_DTYPE),
+            "y_rel_pos": [],
+            "distances": np.empty(0, dtype=np.int32),
+            "sentence_id": np.empty(0, dtype=np.int32),
+            "sentence_id_pos": np.empty(0, dtype=np.int32),
+        }
+
+    X_pairs = np.empty((total_pairs, d_comb), dtype=PAIRWISE_FEATURE_DTYPE)
+    y_arc = np.empty(total_pairs, dtype=np.int32)
+    distances = np.empty(total_pairs, dtype=np.int32)
+    sentence_ids = np.empty(total_pairs, dtype=np.int32)
+    X_pairs_pos = np.empty((total_pos_pairs, d_comb), dtype=PAIRWISE_FEATURE_DTYPE)
+    y_rel_pos = []
+    sentence_ids_pos = np.empty(total_pos_pairs, dtype=np.int32)
+
+    pair_cursor = 0
+    pos_cursor = 0
     for sent in sentence_data:
         aligned = sent["aligned"]
         n_tok = sent["n_aligned"]
@@ -1744,45 +1778,40 @@ def build_pairwise_dataset_for_head(
                 head_of_i = aligned[idx_i]["head_idx"]
                 word_idx_j = aligned[idx_j]["word_idx"]
                 is_arc = int(head_of_i == word_idx_j)
-                rel_label = aligned[idx_i]["dep_rel"] if is_arc else "NO_ARC"
 
-                X_pairs_list.append(c_ij)
-                y_arc_list.append(is_arc)
-                distances_list.append(abs(
+                X_pairs[pair_cursor] = c_ij
+                y_arc[pair_cursor] = is_arc
+                distances[pair_cursor] = abs(
                     aligned[idx_i]["scrambled_word_idx"]
                     - aligned[idx_j]["scrambled_word_idx"]
-                ))
-                sentence_ids_list.append(sid)
+                )
+                sentence_ids[pair_cursor] = sid
+                pair_cursor += 1
 
                 if is_arc:
-                    X_pairs_pos_list.append(c_ij)
-                    y_rel_pos_list.append(rel_label)
-                    sentence_ids_pos_list.append(sid)
+                    X_pairs_pos[pos_cursor] = c_ij
+                    y_rel_pos.append(aligned[idx_i]["dep_rel"])
+                    sentence_ids_pos[pos_cursor] = sid
+                    pos_cursor += 1
 
-    d_comb = _pairwise_feature_dim(combination, d_head)
-    if not X_pairs_list:
-        return {
-            "X_pairs": np.empty((0, d_comb), dtype=np.float32),
-            "y_arc": np.empty(0, dtype=np.int32),
-            "X_pairs_pos": np.empty((0, d_comb), dtype=np.float32),
-            "y_rel_pos": [],
-            "distances": np.empty(0, dtype=np.int32),
-            "sentence_id": np.empty(0, dtype=np.int32),
-            "sentence_id_pos": np.empty(0, dtype=np.int32),
-        }
+    if pair_cursor != total_pairs:
+        X_pairs = X_pairs[:pair_cursor]
+        y_arc = y_arc[:pair_cursor]
+        distances = distances[:pair_cursor]
+        sentence_ids = sentence_ids[:pair_cursor]
+    if pos_cursor != total_pos_pairs:
+        X_pairs_pos = X_pairs_pos[:pos_cursor]
+        sentence_ids_pos = sentence_ids_pos[:pos_cursor]
+        y_rel_pos = y_rel_pos[:pos_cursor]
 
     return {
-        "X_pairs": np.stack(X_pairs_list),
-        "y_arc": np.array(y_arc_list, dtype=np.int32),
-        "X_pairs_pos": (
-            np.stack(X_pairs_pos_list)
-            if X_pairs_pos_list
-            else np.empty((0, d_comb), dtype=np.float32)
-        ),
-        "y_rel_pos": y_rel_pos_list,
-        "distances": np.array(distances_list, dtype=np.int32),
-        "sentence_id": np.array(sentence_ids_list, dtype=np.int32),
-        "sentence_id_pos": np.array(sentence_ids_pos_list, dtype=np.int32),
+        "X_pairs": X_pairs,
+        "y_arc": y_arc,
+        "X_pairs_pos": X_pairs_pos,
+        "y_rel_pos": y_rel_pos,
+        "distances": distances,
+        "sentence_id": sentence_ids,
+        "sentence_id_pos": sentence_ids_pos,
     }
 
 
@@ -2096,13 +2125,9 @@ def run_probing_pipeline(
             sentence_split=sentence_split,
             batch_size=batch_size,
         )
-
-        print("\n  Caching pairwise sentence data...", flush=True)
-        pairwise_sentence_data = collect_pairwise_sentence_data(
-            extractor, labeler, scrambled_sentences, original_sentences,
-            max_sentences=pairwise_budget,
-            batch_size=batch_size,
-        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         pw_prober = PairwiseDependencyProber(
             combination="concat",
@@ -2110,41 +2135,60 @@ def run_probing_pipeline(
             device=extractor.device,
         )
 
-        for l, h in tqdm(head_keys, total=total, desc="Pairwise heads", unit="head"):
-            pw_data = build_pairwise_dataset_for_head(
-                pairwise_sentence_data,
-                l,
-                h,
-                combination="concat",
-                d_head=extractor.d_head,
+        for chunk_start in tqdm(
+            range(0, total, PAIRWISE_HEAD_CHUNK_SIZE),
+            total=(total + PAIRWISE_HEAD_CHUNK_SIZE - 1) // PAIRWISE_HEAD_CHUNK_SIZE,
+            desc="Pairwise head chunks",
+            unit="chunk",
+        ):
+            chunk_keys = head_keys[chunk_start:chunk_start + PAIRWISE_HEAD_CHUNK_SIZE]
+            print(
+                f"\n  Caching pairwise sentence data for heads {chunk_start + 1}-{chunk_start + len(chunk_keys)}",
+                flush=True,
             )
-            X_pairs = pw_data["X_pairs"]
+            pairwise_sentence_data = collect_pairwise_sentence_data(
+                extractor, labeler, scrambled_sentences, original_sentences,
+                max_sentences=pairwise_budget,
+                batch_size=batch_size,
+                head_keys=chunk_keys,
+            )
 
-            if X_pairs.shape[0] < 20:
+            for l, h in chunk_keys:
+                pw_data = build_pairwise_dataset_for_head(
+                    pairwise_sentence_data,
+                    l,
+                    h,
+                    combination="concat",
+                    d_head=extractor.d_head,
+                )
+                X_pairs = pw_data["X_pairs"]
+
+                if X_pairs.shape[0] < 20:
+                    per_head_pairwise[(l, h)] = {
+                        "arc": None, "relation": None,
+                    }
+                    del pw_data
+                    continue
+
+                arc_result = pw_prober.probe_arc(
+                    X_pairs, pw_data["y_arc"], pw_data.get("sentence_id"),
+                )
+                rel_result = pw_prober.probe_relation(
+                    pw_data["X_pairs_pos"], pw_data["y_rel_pos"],
+                    pw_data.get("sentence_id_pos"),
+                )
+
                 per_head_pairwise[(l, h)] = {
-                    "arc": None, "relation": None,
+                    "arc": arc_result,
+                    "relation": rel_result,
                 }
-                continue
 
-            arc_result = pw_prober.probe_arc(
-                X_pairs, pw_data["y_arc"], pw_data.get("sentence_id"),
-            )
-            rel_result = pw_prober.probe_relation(
-                pw_data["X_pairs_pos"], pw_data["y_rel_pos"],
-                pw_data.get("sentence_id_pos"),
-            )
+                del pw_data
 
-            per_head_pairwise[(l, h)] = {
-                "arc": arc_result,
-                "relation": rel_result,
-            }
-
-            del pw_data
-            if (l * n_heads + h + 1) % 12 == 0:
-                gc.collect()
-
-        del pairwise_sentence_data
-        gc.collect()
+            del pairwise_sentence_data
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Layer-wise summaries
     layer_summary = _compute_layer_summary(per_head, n_layers, n_heads)
