@@ -74,7 +74,7 @@ def plot_three_heatmaps(results, output_dir):
 
     subtitles = {
         "translation_vs_impossible": "Blue = Translator more focused\nRed = Impossible LM more focused",
-        "translation_vs_normal": "Blue = Translator more focused\nRed = Standard GPT-2 more focused",
+        "translation_vs_normal": "Blue = Standard GPT-2 more focused\nRed = Translator more focused",
         "normal_vs_impossible": "Blue = Standard GPT-2 more focused\nRed = Impossible LM more focused",
     }
 
@@ -89,10 +89,13 @@ def plot_three_heatmaps(results, output_dir):
     for idx, pair in enumerate(PAIR_ORDER):
         ax = axes[idx]
         delta_H = np.array(results["comparisons"][pair]["delta_H"])
-        n_layers, n_heads = delta_H.shape
+
+        # Keep the Standard GPT-2 side blue in both panels where it appears.
+        display_delta_H = -delta_H if pair == "translation_vs_normal" else delta_H
+        n_layers, n_heads = display_delta_H.shape
 
         im = ax.imshow(
-            delta_H,
+            display_delta_H,
             cmap="RdBu",
             aspect="auto",
             interpolation="nearest",
@@ -116,7 +119,7 @@ def plot_three_heatmaps(results, output_dir):
 
         for i in range(n_layers):
             for j in range(n_heads):
-                val = delta_H[i, j]
+                val = display_delta_H[i, j]
                 color = "white" if abs(val) > abs_max * 0.5 else "black"
                 ax.text(
                     j,
