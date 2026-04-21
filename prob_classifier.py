@@ -1134,48 +1134,41 @@ class PairwiseDependencyProber:
 # Pairwise dataset construction
 # ---------------------------------------------------------------------------
 
-def build_pairwise_dataset(
+def _pairwise_feature_dim(combination: str, d_head: int) -> int:
+    if combination == "concat":
+        return d_head * 2
+    if combination in ("diff", "product"):
+        return d_head
+    return d_head * 4
+
+
+def collect_pairwise_sentence_data(
     extractor: HeadRepresentationExtractor,
     labeler: SyntacticLabeler,
     scrambled_sentences: list[str],
     original_sentences: list[str],
-    combination: str = "concat",
     max_sentences: int = None,
 ):
-    """Build pairwise token-pair dataset for dependency structure probing.
+    """Cache aligned sentence-level data for pairwise probing.
 
-    For each sentence, constructs all ordered pairs (i, j) where i != j,
-    with gold labels from the original parse.
-
-    Returns dict keyed by (layer, head) with:
-        X_pairs: combined representations c_ij
-        y_arc: binary arc labels
-        y_rel: relation labels (for positive pairs)
-        distances: |i - j| for distance baseline
+    This keeps one copy of the per-sentence head representations in memory and
+    lets us materialise one head's pairwise dataset at a time, which avoids the
+    enormous RAM blow-up from storing pairwise matrices for all 144 heads at
+    once.
     """
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
         original_sentences = original_sentences[:max_sentences]
 
-    n_layers = extractor.n_layers
-    n_heads = extractor.n_heads
-    combiner = PairwiseDependencyProber(combination=combination)
-
-    # Collect per-sentence pairwise data, then combine per-head
-    # To save memory, accumulate X for one (layer, head) at a time is impractical
-    # Instead, collect aligned sentence data first, then build pairs per head
-
-    sentence_data = []  # list of dicts with aligned info and head_reps
-
+    sentence_data = []
     skipped = 0
     iterator = tqdm(
         zip(scrambled_sentences, original_sentences),
         total=len(scrambled_sentences),
-        desc="Pairwise dataset",
+        desc="Pairwise sentence cache",
         unit="sent",
     )
     for i, (scrambled, original) in enumerate(iterator):
-
         labels = labeler.extract_labels(original)
         head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
         if head_reps is None:
@@ -1185,7 +1178,7 @@ def build_pairwise_dataset(
         aligned = align_scrambled_to_original_by_identity(
             scrambled, offsets, labeler, labels,
         )
-        if len(aligned) < 2:  # need at least 2 tokens for pairs
+        if len(aligned) < 2:
             skipped += 1
             continue
 
@@ -1197,92 +1190,95 @@ def build_pairwise_dataset(
         })
 
     if skipped:
-        print(f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (pairwise alignment)")
+        print(
+            f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (pairwise alignment)",
+            flush=True,
+        )
 
-    # Now build per-head pairwise datasets. Arc label uses the original-parse
-    # word index (aligned[*].word_idx is the spaCy token index in the ORIGINAL
-    # sentence), so `aligned[i].head_idx == aligned[j].word_idx` is exactly
-    # "token i's gold head is token j".
-    dataset = {}
-    for l in range(n_layers):
-        for h in range(n_heads):
-            X_pairs_list = []
-            y_arc_list = []
-            y_rel_pos_list = []    # relation labels for positive pairs only
-            X_pairs_pos_list = []  # representations for positive pairs only
-            distances_list = []
-            sentence_ids_list = []
-            sentence_ids_pos_list = []
+    return sentence_data
 
-            for sent in sentence_data:
-                aligned = sent["aligned"]
-                n_tok = sent["n_aligned"]
-                reps = sent["head_reps"][(l, h)]  # (seq, d_head)
-                sid = sent["sentence_id"]
 
-                for idx_i in range(n_tok):
-                    for idx_j in range(n_tok):
-                        if idx_i == idx_j:
-                            continue
+def build_pairwise_dataset_for_head(
+    sentence_data,
+    layer_idx: int,
+    head_idx: int,
+    *,
+    combination: str = "concat",
+    d_head: int,
+):
+    """Materialise one head's pairwise dataset from cached sentence data."""
+    combiner = PairwiseDependencyProber(combination=combination)
+    X_pairs_list = []
+    y_arc_list = []
+    y_rel_pos_list = []
+    X_pairs_pos_list = []
+    distances_list = []
+    sentence_ids_list = []
+    sentence_ids_pos_list = []
 
-                        sw_i = aligned[idx_i]["subword_idx"]
-                        sw_j = aligned[idx_j]["subword_idx"]
+    for sent in sentence_data:
+        aligned = sent["aligned"]
+        n_tok = sent["n_aligned"]
+        reps = sent["head_reps"][(layer_idx, head_idx)]
+        sid = sent["sentence_id"]
 
-                        if sw_i >= reps.shape[0] or sw_j >= reps.shape[0]:
-                            continue
+        for idx_i in range(n_tok):
+            for idx_j in range(n_tok):
+                if idx_i == idx_j:
+                    continue
 
-                        h_i = reps[sw_i]
-                        h_j = reps[sw_j]
-                        c_ij = combiner.combine(h_i, h_j)
+                sw_i = aligned[idx_i]["subword_idx"]
+                sw_j = aligned[idx_j]["subword_idx"]
+                if sw_i >= reps.shape[0] or sw_j >= reps.shape[0]:
+                    continue
 
-                        head_of_i = aligned[idx_i]["head_idx"]
-                        word_idx_j = aligned[idx_j]["word_idx"]
-                        is_arc = int(head_of_i == word_idx_j)
-                        rel_label = aligned[idx_i]["dep_rel"] if is_arc else "NO_ARC"
+                h_i = reps[sw_i]
+                h_j = reps[sw_j]
+                c_ij = combiner.combine(h_i, h_j)
 
-                        X_pairs_list.append(c_ij)
-                        y_arc_list.append(is_arc)
-                        distances_list.append(abs(
-                            aligned[idx_i]["scrambled_word_idx"]
-                            - aligned[idx_j]["scrambled_word_idx"]
-                        ))
-                        sentence_ids_list.append(sid)
+                head_of_i = aligned[idx_i]["head_idx"]
+                word_idx_j = aligned[idx_j]["word_idx"]
+                is_arc = int(head_of_i == word_idx_j)
+                rel_label = aligned[idx_i]["dep_rel"] if is_arc else "NO_ARC"
 
-                        if is_arc:
-                            X_pairs_pos_list.append(c_ij)
-                            y_rel_pos_list.append(rel_label)
-                            sentence_ids_pos_list.append(sid)
+                X_pairs_list.append(c_ij)
+                y_arc_list.append(is_arc)
+                distances_list.append(abs(
+                    aligned[idx_i]["scrambled_word_idx"]
+                    - aligned[idx_j]["scrambled_word_idx"]
+                ))
+                sentence_ids_list.append(sid)
 
-            if len(X_pairs_list) > 0:
-                dataset[(l, h)] = {
-                    "X_pairs": np.stack(X_pairs_list),
-                    "y_arc": np.array(y_arc_list, dtype=np.int32),
-                    "X_pairs_pos": (
-                        np.stack(X_pairs_pos_list)
-                        if X_pairs_pos_list
-                        else np.empty((0, X_pairs_list[0].shape[0]))
-                    ),
-                    "y_rel_pos": y_rel_pos_list,
-                    "distances": np.array(distances_list, dtype=np.int32),
-                    "sentence_id": np.array(sentence_ids_list, dtype=np.int32),
-                    "sentence_id_pos": np.array(
-                        sentence_ids_pos_list, dtype=np.int32,
-                    ),
-                }
-            else:
-                d_comb = extractor.d_head * (2 if combination == "concat" else
-                                              1 if combination in ("diff", "product") else 4)
-                dataset[(l, h)] = {
-                    "X_pairs": np.empty((0, d_comb)),
-                    "y_arc": np.empty(0, dtype=np.int32),
-                    "X_pairs_pos": np.empty((0, d_comb)),
-                    "y_rel_pos": [],
-                    "distances": np.empty(0, dtype=np.int32),
-                    "sentence_id": np.empty(0, dtype=np.int32),
-                    "sentence_id_pos": np.empty(0, dtype=np.int32),
-                }
+                if is_arc:
+                    X_pairs_pos_list.append(c_ij)
+                    y_rel_pos_list.append(rel_label)
+                    sentence_ids_pos_list.append(sid)
 
-    return dataset
+    d_comb = _pairwise_feature_dim(combination, d_head)
+    if not X_pairs_list:
+        return {
+            "X_pairs": np.empty((0, d_comb), dtype=np.float32),
+            "y_arc": np.empty(0, dtype=np.int32),
+            "X_pairs_pos": np.empty((0, d_comb), dtype=np.float32),
+            "y_rel_pos": [],
+            "distances": np.empty(0, dtype=np.int32),
+            "sentence_id": np.empty(0, dtype=np.int32),
+            "sentence_id_pos": np.empty(0, dtype=np.int32),
+        }
+
+    return {
+        "X_pairs": np.stack(X_pairs_list),
+        "y_arc": np.array(y_arc_list, dtype=np.int32),
+        "X_pairs_pos": (
+            np.stack(X_pairs_pos_list)
+            if X_pairs_pos_list
+            else np.empty((0, d_comb), dtype=np.float32)
+        ),
+        "y_rel_pos": y_rel_pos_list,
+        "distances": np.array(distances_list, dtype=np.int32),
+        "sentence_id": np.array(sentence_ids_list, dtype=np.int32),
+        "sentence_id_pos": np.array(sentence_ids_pos_list, dtype=np.int32),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1590,20 +1586,18 @@ def run_probing_pipeline(
                 flush=True,
             )
 
-        # ---- Pairwise dependency structure probing ----
-        print("\n  Building pairwise probing dataset...", flush=True)
-        pw_dataset = build_pairwise_dataset(
-            extractor, labeler, scrambled_sentences, original_sentences,
-            combination="concat",
-            max_sentences=pairwise_budget,
-        )
-
         print("\n  Computing pairwise baselines...", flush=True)
         pw_baselines = compute_pairwise_baselines(
             extractor, labeler, scrambled_sentences, original_sentences,
             combination="concat",
             max_sentences=pairwise_budget,
             sentence_split=sentence_split,
+        )
+
+        print("\n  Caching pairwise sentence data...", flush=True)
+        pairwise_sentence_data = collect_pairwise_sentence_data(
+            extractor, labeler, scrambled_sentences, original_sentences,
+            max_sentences=pairwise_budget,
         )
 
         pw_prober = PairwiseDependencyProber(
@@ -1613,7 +1607,13 @@ def run_probing_pipeline(
         )
 
         for l, h in tqdm(head_keys, total=total, desc="Pairwise heads", unit="head"):
-            pw_data = pw_dataset[(l, h)]
+            pw_data = build_pairwise_dataset_for_head(
+                pairwise_sentence_data,
+                l,
+                h,
+                combination="concat",
+                d_head=extractor.d_head,
+            )
             X_pairs = pw_data["X_pairs"]
 
             if X_pairs.shape[0] < 20:
@@ -1635,7 +1635,11 @@ def run_probing_pipeline(
                 "relation": rel_result,
             }
 
-        del pw_dataset
+            del pw_data
+            if (l * n_heads + h + 1) % 12 == 0:
+                gc.collect()
+
+        del pairwise_sentence_data
         gc.collect()
 
     # Layer-wise summaries
