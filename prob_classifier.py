@@ -1617,26 +1617,28 @@ def collect_pairwise_sentence_data(
         desc="Pairwise sentence cache",
         unit="sent",
     )
+    iterator = zip(scrambled_sentences, original_sentences)
     for i, (scrambled, original) in enumerate(iterator):
         labels = labeler.extract_labels(original)
         head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
         if head_reps is None:
             skipped += 1
+            progress.update(1)
             continue
 
-        for local_idx, (scrambled, labels, result) in enumerate(
-            zip(batch_scrambled, batch_labels, batch_results)
-        ):
-            sentence_id = start + local_idx
-            head_reps, token_ids, tokens, offsets = result
-            if head_reps is None:
-                skipped += 1
-                continue
-            if head_key_set is not None:
-                head_reps = {
-                    key: np.asarray(head_reps[key], dtype=PAIRWISE_FEATURE_DTYPE)
-                    for key in head_key_set
-                }
+        if head_key_set is not None:
+            head_reps = {
+                key: np.asarray(head_reps[key], dtype=PAIRWISE_FEATURE_DTYPE)
+                for key in head_key_set
+            }
+
+        aligned = align_scrambled_to_original_by_identity(
+            scrambled, offsets, labeler, labels,
+        )
+        if len(aligned) < 2:
+            skipped += 1
+            progress.update(1)
+            continue
 
         sentence_data.append({
             "aligned": aligned,
@@ -1644,6 +1646,9 @@ def collect_pairwise_sentence_data(
             "n_aligned": len(aligned),
             "sentence_id": i,
         })
+        progress.update(1)
+
+    progress.close()
 
     if skipped:
         print(
