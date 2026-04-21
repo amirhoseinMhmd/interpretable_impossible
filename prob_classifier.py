@@ -132,38 +132,93 @@ class HeadRepresentationExtractor:
     # -- extraction ---------------------------------------------------------
 
     def extract(self, text: str):
+        return self.extract_batch([text])[0]
+
+    def extract_batch(self, texts: list[str]):
+        """Batch extraction to keep the GPU busy during dataset building."""
+        if not texts:
+            return []
 
         self._head_outputs.clear()
         encoded = self.tokenizer(
-            text,
+            texts,
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=512,
             return_offsets_mapping=True,
         )
-        offsets = [tuple(span) for span in encoded.pop("offset_mapping")[0].tolist()]
+        offset_mapping = encoded.pop("offset_mapping")
         inputs = {k: v.to(self.device) for k, v in encoded.items()}
 
-        seq_len = inputs["input_ids"].shape[1]
-        if seq_len == 0:
-            return None, [], [], []
+        seq_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        if max(seq_lens, default=0) == 0:
+            return [(None, [], [], []) for _ in texts]
 
         with torch.no_grad():
             self.model(**inputs)
 
-        token_ids = inputs["input_ids"][0].tolist()
-        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+        input_ids_cpu = inputs["input_ids"].detach().cpu()
+        offsets_cpu = offset_mapping.tolist()
+        results = []
 
-        head_reps = {}
-        for layer_idx in range(self.n_layers):
-            per_head = self._head_outputs[layer_idx][0]  # (seq, n_heads, d_head)
-            for head_idx in range(self.n_heads):
-                arr = per_head[:, head_idx, :].numpy()
-                # Replace NaN/Inf at source to avoid downstream data loss
-                np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                head_reps[(layer_idx, head_idx)] = arr
+        for batch_idx, seq_len in enumerate(seq_lens):
+            seq_len = int(seq_len)
+            if seq_len <= 0:
+                results.append((None, [], [], []))
+                continue
 
-        return head_reps, token_ids, tokens, offsets
+            token_ids = input_ids_cpu[batch_idx, :seq_len].tolist()
+            tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+            offsets = [tuple(span) for span in offsets_cpu[batch_idx][:seq_len]]
+
+            head_reps = {}
+            for layer_idx in range(self.n_layers):
+                per_head = self._head_outputs[layer_idx][batch_idx, :seq_len]
+                for head_idx in range(self.n_heads):
+                    arr = per_head[:, head_idx, :].numpy()
+                    np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    head_reps[(layer_idx, head_idx)] = arr
+
+            results.append((head_reps, token_ids, tokens, offsets))
+
+        return results
+
+    def embed_batch(self, texts: list[str]):
+        """Batch GPT-2 input embeddings for baseline probes."""
+        if not texts:
+            return []
+
+        encoded = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_offsets_mapping=True,
+        )
+        offset_mapping = encoded.pop("offset_mapping")
+        inputs = {k: v.to(self.device) for k, v in encoded.items()}
+        seq_lens = inputs["attention_mask"].sum(dim=1).tolist()
+
+        with torch.no_grad():
+            embeddings = self.model.transformer.wte(inputs["input_ids"]).detach().cpu()
+
+        input_ids_cpu = inputs["input_ids"].detach().cpu()
+        offsets_cpu = offset_mapping.tolist()
+        results = []
+        for batch_idx, seq_len in enumerate(seq_lens):
+            seq_len = int(seq_len)
+            if seq_len <= 0:
+                results.append((None, [], []))
+                continue
+
+            emb = embeddings[batch_idx, :seq_len].numpy()
+            token_ids = input_ids_cpu[batch_idx, :seq_len].tolist()
+            offsets = [tuple(span) for span in offsets_cpu[batch_idx][:seq_len]]
+            results.append((emb, token_ids, offsets))
+
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +303,7 @@ def build_probing_dataset(
     scrambled_sentences: list[str],
     original_sentences: list[str],
     max_sentences: int = None,
+    batch_size: int = 8,
 ):
     if max_sentences:
         scrambled_sentences = scrambled_sentences[:max_sentences]
@@ -266,44 +322,44 @@ def build_probing_dataset(
     }
 
     skipped = 0
-    iterator = tqdm(
-        zip(scrambled_sentences, original_sentences),
-        total=len(scrambled_sentences),
-        desc="Probing dataset",
-        unit="sent",
-    )
-    for i, (scrambled, original) in enumerate(iterator):
+    progress = tqdm(total=len(scrambled_sentences), desc="Probing dataset", unit="sent")
+    for start in range(0, len(scrambled_sentences), batch_size):
+        batch_scrambled = scrambled_sentences[start:start + batch_size]
+        batch_original = original_sentences[start:start + batch_size]
+        batch_labels = [labeler.extract_labels(original) for original in batch_original]
+        batch_results = extractor.extract_batch(batch_scrambled)
 
-        # Gold labels from original sentence
-        labels = labeler.extract_labels(original)
+        for local_idx, (scrambled, labels, result) in enumerate(
+            zip(batch_scrambled, batch_labels, batch_results)
+        ):
+            sentence_id = start + local_idx
+            head_reps, token_ids, tokens, offsets = result
+            if head_reps is None:
+                skipped += 1
+                continue
 
-        # Model representations from scrambled sentence
-        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
-        if head_reps is None:
-            skipped += 1
-            continue
+            aligned = align_scrambled_to_original_by_identity(
+                scrambled, offsets, labeler, labels,
+            )
+            if len(aligned) == 0:
+                skipped += 1
+                continue
 
-        # Identity-based alignment of scrambled words to original gold labels
-        aligned = align_scrambled_to_original_by_identity(
-            scrambled, offsets, labeler, labels,
-        )
-        if len(aligned) == 0:
-            skipped += 1
-            continue
+            for entry in aligned:
+                sw_idx = entry["subword_idx"]
+                for l in range(n_layers):
+                    for h in range(n_heads):
+                        rep = head_reps[(l, h)]
+                        if sw_idx < rep.shape[0]:
+                            dataset[(l, h)]["X"].append(rep[sw_idx])
+                            dataset[(l, h)]["pos"].append(entry["pos"])
+                            dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
+                            dataset[(l, h)]["depth"].append(entry["depth"])
+                            dataset[(l, h)]["head_idx"].append(entry["head_idx"])
+                            dataset[(l, h)]["sentence_id"].append(sentence_id)
 
-        # Collect aligned representations and labels
-        for entry in aligned:
-            sw_idx = entry["subword_idx"]
-            for l in range(n_layers):
-                for h in range(n_heads):
-                    rep = head_reps[(l, h)]
-                    if sw_idx < rep.shape[0]:
-                        dataset[(l, h)]["X"].append(rep[sw_idx])
-                        dataset[(l, h)]["pos"].append(entry["pos"])
-                        dataset[(l, h)]["dep_rel"].append(entry["dep_rel"])
-                        dataset[(l, h)]["depth"].append(entry["depth"])
-                        dataset[(l, h)]["head_idx"].append(entry["head_idx"])
-                        dataset[(l, h)]["sentence_id"].append(i)
+        progress.update(len(batch_scrambled))
+    progress.close()
 
     if skipped:
         print(f"  Skipped {skipped}/{len(scrambled_sentences)} sentences (alignment)")
@@ -1148,6 +1204,7 @@ def collect_pairwise_sentence_data(
     scrambled_sentences: list[str],
     original_sentences: list[str],
     max_sentences: int = None,
+    batch_size: int = 8,
 ):
     """Cache aligned sentence-level data for pairwise probing.
 
@@ -1162,32 +1219,42 @@ def collect_pairwise_sentence_data(
 
     sentence_data = []
     skipped = 0
-    iterator = tqdm(
-        zip(scrambled_sentences, original_sentences),
+    progress = tqdm(
         total=len(scrambled_sentences),
         desc="Pairwise sentence cache",
         unit="sent",
     )
-    for i, (scrambled, original) in enumerate(iterator):
-        labels = labeler.extract_labels(original)
-        head_reps, token_ids, tokens, offsets = extractor.extract(scrambled)
-        if head_reps is None:
-            skipped += 1
-            continue
+    for start in range(0, len(scrambled_sentences), batch_size):
+        batch_scrambled = scrambled_sentences[start:start + batch_size]
+        batch_original = original_sentences[start:start + batch_size]
+        batch_labels = [labeler.extract_labels(original) for original in batch_original]
+        batch_results = extractor.extract_batch(batch_scrambled)
 
-        aligned = align_scrambled_to_original_by_identity(
-            scrambled, offsets, labeler, labels,
-        )
-        if len(aligned) < 2:
-            skipped += 1
-            continue
+        for local_idx, (scrambled, labels, result) in enumerate(
+            zip(batch_scrambled, batch_labels, batch_results)
+        ):
+            sentence_id = start + local_idx
+            head_reps, token_ids, tokens, offsets = result
+            if head_reps is None:
+                skipped += 1
+                continue
 
-        sentence_data.append({
-            "aligned": aligned,
-            "head_reps": head_reps,
-            "n_aligned": len(aligned),
-            "sentence_id": i,
-        })
+            aligned = align_scrambled_to_original_by_identity(
+                scrambled, offsets, labeler, labels,
+            )
+            if len(aligned) < 2:
+                skipped += 1
+                continue
+
+            sentence_data.append({
+                "aligned": aligned,
+                "head_reps": head_reps,
+                "n_aligned": len(aligned),
+                "sentence_id": sentence_id,
+            })
+
+        progress.update(len(batch_scrambled))
+    progress.close()
 
     if skipped:
         print(
@@ -1295,6 +1362,7 @@ def compute_pairwise_baselines(
     test_size: float = 0.2,
     random_state: int = 42,
     sentence_split=None,
+    batch_size: int = 8,
 ):
     """Word-embedding pairwise baseline and distance baseline."""
     if max_sentences:
@@ -1302,7 +1370,6 @@ def compute_pairwise_baselines(
         original_sentences = original_sentences[:max_sentences]
 
     combiner = PairwiseDependencyProber(combination=combination)
-    wte = extractor.model.transformer.wte
 
     X_emb_pairs = []
     y_arc_all = []
@@ -1312,66 +1379,59 @@ def compute_pairwise_baselines(
     sentence_ids_all = []
     sentence_ids_pos = []
 
-    iterator = tqdm(
-        zip(scrambled_sentences, original_sentences),
-        total=len(scrambled_sentences),
-        desc="Pairwise baseline",
-        unit="sent",
-    )
-    for i, (scrambled, original) in enumerate(iterator):
+    progress = tqdm(total=len(scrambled_sentences), desc="Pairwise baseline", unit="sent")
+    for start in range(0, len(scrambled_sentences), batch_size):
+        batch_scrambled = scrambled_sentences[start:start + batch_size]
+        batch_original = original_sentences[start:start + batch_size]
+        batch_labels = [labeler.extract_labels(original) for original in batch_original]
+        batch_embeds = extractor.embed_batch(batch_scrambled)
 
-        labels = labeler.extract_labels(original)
-        encoded = extractor.tokenizer(
-            scrambled,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            return_offsets_mapping=True,
-        )
-        offsets = [tuple(s) for s in encoded.pop("offset_mapping")[0].tolist()]
-        inputs = {k: v.to(extractor.device) for k, v in encoded.items()}
+        for local_idx, (scrambled, labels, embed_result) in enumerate(
+            zip(batch_scrambled, batch_labels, batch_embeds)
+        ):
+            sentence_id = start + local_idx
+            embeddings, token_ids, offsets = embed_result
+            if embeddings is None:
+                continue
 
-        if inputs["input_ids"].shape[1] == 0:
-            continue
+            aligned = align_scrambled_to_original_by_identity(
+                scrambled, offsets, labeler, labels,
+            )
+            if len(aligned) < 2:
+                continue
 
-        with torch.no_grad():
-            embeddings = wte(inputs["input_ids"])[0].cpu().numpy()
+            for idx_i in range(len(aligned)):
+                for idx_j in range(len(aligned)):
+                    if idx_i == idx_j:
+                        continue
 
-        aligned = align_scrambled_to_original_by_identity(
-            scrambled, offsets, labeler, labels,
-        )
-        if len(aligned) < 2:
-            continue
+                    sw_i = aligned[idx_i]["subword_idx"]
+                    sw_j = aligned[idx_j]["subword_idx"]
+                    if sw_i >= embeddings.shape[0] or sw_j >= embeddings.shape[0]:
+                        continue
 
-        for idx_i in range(len(aligned)):
-            for idx_j in range(len(aligned)):
-                if idx_i == idx_j:
-                    continue
+                    c_ij = combiner.combine(embeddings[sw_i], embeddings[sw_j])
 
-                sw_i = aligned[idx_i]["subword_idx"]
-                sw_j = aligned[idx_j]["subword_idx"]
-                if sw_i >= embeddings.shape[0] or sw_j >= embeddings.shape[0]:
-                    continue
+                    head_of_i = aligned[idx_i]["head_idx"]
+                    word_idx_j = aligned[idx_j]["word_idx"]
+                    is_arc = int(head_of_i == word_idx_j)
+                    rel_label = aligned[idx_i]["dep_rel"] if is_arc else "NO_ARC"
 
-                c_ij = combiner.combine(embeddings[sw_i], embeddings[sw_j])
+                    X_emb_pairs.append(c_ij)
+                    y_arc_all.append(is_arc)
+                    distances_all.append(abs(
+                        aligned[idx_i]["scrambled_word_idx"]
+                        - aligned[idx_j]["scrambled_word_idx"]
+                    ))
+                    sentence_ids_all.append(sentence_id)
 
-                head_of_i = aligned[idx_i]["head_idx"]
-                word_idx_j = aligned[idx_j]["word_idx"]
-                is_arc = int(head_of_i == word_idx_j)
-                rel_label = aligned[idx_i]["dep_rel"] if is_arc else "NO_ARC"
+                    if is_arc:
+                        X_emb_pos.append(c_ij)
+                        y_rel_pos.append(rel_label)
+                        sentence_ids_pos.append(sentence_id)
 
-                X_emb_pairs.append(c_ij)
-                y_arc_all.append(is_arc)
-                distances_all.append(abs(
-                    aligned[idx_i]["scrambled_word_idx"]
-                    - aligned[idx_j]["scrambled_word_idx"]
-                ))
-                sentence_ids_all.append(i)
-
-                if is_arc:
-                    X_emb_pos.append(c_ij)
-                    y_rel_pos.append(rel_label)
-                    sentence_ids_pos.append(i)
+        progress.update(len(batch_scrambled))
+    progress.close()
 
     result = {"word_emb_arc": None, "word_emb_rel": None, "distance_arc": None}
 
@@ -1426,6 +1486,7 @@ def compute_word_embedding_baseline(
     test_size: float = 0.2,
     random_state: int = 42,
     sentence_split=None,
+    batch_size: int = 8,
 ):
     """Train probes on word embeddings (wte) as a control baseline."""
     if max_sentences:
@@ -1434,45 +1495,37 @@ def compute_word_embedding_baseline(
 
     X_all, pos_all, dep_all, depth_all = [], [], [], []
     sent_ids_all = []
-    wte = extractor.model.transformer.wte  # word token embedding layer
 
-    iterator = tqdm(
-        zip(scrambled_sentences, original_sentences),
-        total=len(scrambled_sentences),
-        desc="Word-emb baseline",
-        unit="sent",
-    )
-    for i, (scrambled, original) in enumerate(iterator):
+    progress = tqdm(total=len(scrambled_sentences), desc="Word-emb baseline", unit="sent")
+    for start in range(0, len(scrambled_sentences), batch_size):
+        batch_scrambled = scrambled_sentences[start:start + batch_size]
+        batch_original = original_sentences[start:start + batch_size]
+        batch_labels = [labeler.extract_labels(original) for original in batch_original]
+        batch_embeds = extractor.embed_batch(batch_scrambled)
 
-        labels = labeler.extract_labels(original)
-        encoded = extractor.tokenizer(
-            scrambled,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            return_offsets_mapping=True,
-        )
-        offsets = [tuple(s) for s in encoded.pop("offset_mapping")[0].tolist()]
-        inputs = {k: v.to(extractor.device) for k, v in encoded.items()}
+        for local_idx, (scrambled, labels, embed_result) in enumerate(
+            zip(batch_scrambled, batch_labels, batch_embeds)
+        ):
+            sentence_id = start + local_idx
+            embeddings, token_ids, offsets = embed_result
+            if embeddings is None:
+                continue
 
-        if inputs["input_ids"].shape[1] == 0:
-            continue
+            aligned = align_scrambled_to_original_by_identity(
+                scrambled, offsets, labeler, labels,
+            )
 
-        with torch.no_grad():
-            embeddings = wte(inputs["input_ids"])[0].cpu().numpy()  # (seq, emb)
+            for entry in aligned:
+                sw_idx = entry["subword_idx"]
+                if sw_idx < embeddings.shape[0]:
+                    X_all.append(embeddings[sw_idx])
+                    pos_all.append(entry["pos"])
+                    dep_all.append(entry["dep_rel"])
+                    depth_all.append(entry["depth"])
+                    sent_ids_all.append(sentence_id)
 
-        aligned = align_scrambled_to_original_by_identity(
-            scrambled, offsets, labeler, labels,
-        )
-
-        for entry in aligned:
-            sw_idx = entry["subword_idx"]
-            if sw_idx < embeddings.shape[0]:
-                X_all.append(embeddings[sw_idx])
-                pos_all.append(entry["pos"])
-                dep_all.append(entry["dep_rel"])
-                depth_all.append(entry["depth"])
-                sent_ids_all.append(i)
+        progress.update(len(batch_scrambled))
+    progress.close()
 
     if len(X_all) < 20:
         return {"pos": None, "dep_rel": None, "depth": None}
@@ -1510,6 +1563,7 @@ def run_probing_pipeline(
     sentence_split=None,
     pairwise_max_sentences: int = None,
     skip_pairwise: bool = False,
+    batch_size: int = 8,
 ):
 
     print(f"\n{'='*60}")
@@ -1525,6 +1579,7 @@ def run_probing_pipeline(
     dataset = build_probing_dataset(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
+        batch_size=batch_size,
     )
 
     # Word-embedding baseline (token-level)
@@ -1533,6 +1588,7 @@ def run_probing_pipeline(
         extractor, labeler, scrambled_sentences, original_sentences,
         max_sentences=max_sentences,
         sentence_split=sentence_split,
+        batch_size=batch_size,
     )
 
     # Probe each head (token-level)
@@ -1592,12 +1648,14 @@ def run_probing_pipeline(
             combination="concat",
             max_sentences=pairwise_budget,
             sentence_split=sentence_split,
+            batch_size=batch_size,
         )
 
         print("\n  Caching pairwise sentence data...", flush=True)
         pairwise_sentence_data = collect_pairwise_sentence_data(
             extractor, labeler, scrambled_sentences, original_sentences,
             max_sentences=pairwise_budget,
+            batch_size=batch_size,
         )
 
         pw_prober = PairwiseDependencyProber(
@@ -1963,6 +2021,10 @@ def parse_args():
         "--skip_pairwise", action="store_true",
         help="Skip pairwise arc/relation probing entirely.",
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=8,
+        help="Batch size for transformer/embedding extraction stages (default: 8).",
+    )
     return parser.parse_args()
 
 
@@ -1998,6 +2060,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
+        batch_size=args.batch_size,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -2014,6 +2077,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
+        batch_size=args.batch_size,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -2030,6 +2094,7 @@ if __name__ == "__main__":
         sentence_split=sentence_split,
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
+        batch_size=args.batch_size,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
