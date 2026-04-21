@@ -391,7 +391,7 @@ PROBE_PATIENCE = 2
 PROBE_LR = 1e-2
 PROBE_WEIGHT_DECAY = 1e-4
 TOKEN_HEAD_CHUNK_SIZE = 24
-PAIRWISE_HEAD_CHUNK_SIZE = 12
+PAIRWISE_HEAD_CHUNK_SIZE = 1
 PAIRWISE_FEATURE_DTYPE = np.float16
 
 
@@ -2031,6 +2031,7 @@ def run_probing_pipeline(
     pairwise_max_sentences: int = None,
     skip_pairwise: bool = False,
     batch_size: int = 8,
+    pairwise_head_chunk_size: int = PAIRWISE_HEAD_CHUNK_SIZE,
 ):
 
     print(f"\n{'='*60}")
@@ -2136,12 +2137,12 @@ def run_probing_pipeline(
         )
 
         for chunk_start in tqdm(
-            range(0, total, PAIRWISE_HEAD_CHUNK_SIZE),
-            total=(total + PAIRWISE_HEAD_CHUNK_SIZE - 1) // PAIRWISE_HEAD_CHUNK_SIZE,
+            range(0, total, pairwise_head_chunk_size),
+            total=(total + pairwise_head_chunk_size - 1) // pairwise_head_chunk_size,
             desc="Pairwise head chunks",
             unit="chunk",
         ):
-            chunk_keys = head_keys[chunk_start:chunk_start + PAIRWISE_HEAD_CHUNK_SIZE]
+            chunk_keys = head_keys[chunk_start:chunk_start + pairwise_head_chunk_size]
             print(
                 f"\n  Caching pairwise sentence data for heads {chunk_start + 1}-{chunk_start + len(chunk_keys)}",
                 flush=True,
@@ -2515,6 +2516,10 @@ def parse_args():
         "--batch_size", type=int, default=8,
         help="Batch size for transformer/embedding extraction stages (default: 8).",
     )
+    parser.add_argument(
+        "--pairwise_head_chunk_size", type=int, default=PAIRWISE_HEAD_CHUNK_SIZE,
+        help="How many pairwise heads to cache/process at once (default: 1). Lower uses less RAM.",
+    )
     return parser.parse_args()
 
 
@@ -2551,6 +2556,7 @@ if __name__ == "__main__":
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
         batch_size=args.batch_size,
+        pairwise_head_chunk_size=args.pairwise_head_chunk_size,
     )
     print_probing_results(results_translator, "Translator")
 
@@ -2568,6 +2574,7 @@ if __name__ == "__main__":
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
         batch_size=args.batch_size,
+        pairwise_head_chunk_size=args.pairwise_head_chunk_size,
     )
     print_probing_results(results_impossible, "Impossible")
 
@@ -2585,6 +2592,7 @@ if __name__ == "__main__":
         pairwise_max_sentences=args.pairwise_max_sentences,
         skip_pairwise=args.skip_pairwise,
         batch_size=args.batch_size,
+        pairwise_head_chunk_size=args.pairwise_head_chunk_size,
     )
     print_probing_results(results_base, "GPT-2 Base")
 
