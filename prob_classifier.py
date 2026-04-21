@@ -872,6 +872,183 @@ def train_single_probe(X, y, train_mask, test_mask, n_classes,
                 "pred": pred, "y_test": y_te}
 
 
+def _pair_feature_batch(reps, pair_i, pair_j, pair_sel):
+    idx_i = pair_i.index_select(0, pair_sel)
+    idx_j = pair_j.index_select(0, pair_sel)
+    return torch.cat(
+        [reps.index_select(0, idx_i), reps.index_select(0, idx_j)],
+        dim=-1,
+    )
+
+
+def _pair_feature_stats(reps, pair_i, pair_j, idx_all, minibatch):
+    feat_dim = reps.shape[1] * 2
+    sum_ = torch.zeros(feat_dim, device=reps.device, dtype=torch.float64)
+    sumsq = torch.zeros(feat_dim, device=reps.device, dtype=torch.float64)
+    total = 0
+    for s in range(0, idx_all.numel(), minibatch):
+        sel = idx_all[s:s + minibatch]
+        xb = _pair_feature_batch(reps, pair_i, pair_j, sel).to(torch.float32)
+        xb64 = xb.to(torch.float64)
+        sum_ += xb64.sum(dim=0)
+        sumsq += (xb64 * xb64).sum(dim=0)
+        total += xb.shape[0]
+    mean = (sum_ / max(1, total)).to(torch.float32)
+    var = (sumsq / max(1, total)).to(torch.float32) - mean.pow(2)
+    std = var.clamp_min(1e-6).sqrt()
+    return mean.unsqueeze(0), std.unsqueeze(0)
+
+
+def _classification_loss_from_pair_source(
+    reps, pair_i, pair_j, idx_all, y, W, b, mean, std, class_weight, minibatch
+):
+    if idx_all.numel() == 0:
+        return float("inf")
+    loss_sum = 0.0
+    total = 0
+    for s in range(0, idx_all.numel(), minibatch):
+        sel = idx_all[s:s + minibatch]
+        xb = _pair_feature_batch(reps, pair_i, pair_j, sel).to(torch.float32)
+        xb = (xb - mean) / std
+        yb = y.index_select(0, sel)
+        logits = xb @ W + b
+        loss = F.cross_entropy(
+            logits, yb, weight=class_weight, reduction="sum"
+        )
+        loss_sum += float(loss.item())
+        total += yb.shape[0]
+    return loss_sum / max(1, total)
+
+
+def _eval_pair_probe_streaming(
+    reps, pair_i, pair_j, idx_all, y, W, b, mean, std, n_classes, minibatch
+):
+    total = 0
+    correct = 0
+    if n_classes == 2:
+        tp = fp = fn = 0
+    else:
+        support = torch.zeros(n_classes, dtype=torch.float64)
+        tp = torch.zeros(n_classes, dtype=torch.float64)
+        fp = torch.zeros(n_classes, dtype=torch.float64)
+        fn = torch.zeros(n_classes, dtype=torch.float64)
+
+    for s in range(0, idx_all.numel(), minibatch):
+        sel = idx_all[s:s + minibatch]
+        xb = _pair_feature_batch(reps, pair_i, pair_j, sel).to(torch.float32)
+        xb = (xb - mean) / std
+        yb = y.index_select(0, sel)
+        logits = xb @ W + b
+        pred = logits.argmax(-1)
+        correct += int((pred == yb).sum().item())
+        total += int(yb.shape[0])
+
+        if n_classes == 2:
+            tp += int(((pred == 1) & (yb == 1)).sum().item())
+            fp += int(((pred == 1) & (yb == 0)).sum().item())
+            fn += int(((pred == 0) & (yb == 1)).sum().item())
+        else:
+            pred_cpu = pred.detach().cpu()
+            yb_cpu = yb.detach().cpu()
+            for c in range(n_classes):
+                y_c = (yb_cpu == c)
+                p_c = (pred_cpu == c)
+                support[c] += float(y_c.sum().item())
+                tp[c] += float((p_c & y_c).sum().item())
+                fp[c] += float((p_c & ~y_c).sum().item())
+                fn[c] += float((~p_c & y_c).sum().item())
+
+    acc = correct / max(1, total)
+    if n_classes == 2:
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        f1 = 2 * precision * recall / max(1e-9, precision + recall)
+        return {
+            "acc": float(acc),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        }
+
+    total_support = max(1.0, float(support.sum().item()))
+    f1_weighted = 0.0
+    for c in range(n_classes):
+        if support[c] == 0:
+            continue
+        precision = tp[c] / max(1.0, tp[c] + fp[c])
+        recall = tp[c] / max(1.0, tp[c] + fn[c])
+        f1_c = 2 * precision * recall / max(1e-9, precision + recall)
+        f1_weighted += float(f1_c * (support[c] / total_support))
+    return {"acc": float(acc), "f1_weighted": float(f1_weighted)}
+
+
+def train_single_probe_pair_source(
+    reps, pair_i, pair_j, y, train_mask, test_mask, n_classes,
+    epochs=12, lr=1e-2, weight_decay=1e-4, minibatch=4096,
+    class_weight=None, val_frac: float = 0.1, patience: int = 2, seed: int = 0,
+):
+    """Memory-safe pairwise probe trainer that streams concatenated features."""
+    device = reps.device
+    g = torch.Generator(device=device).manual_seed(seed)
+    tr_idx_all = torch.nonzero(train_mask, as_tuple=False).squeeze(-1)
+    use_earlystop = tr_idx_all.numel() >= 100
+    perm_all = tr_idx_all[torch.randperm(tr_idx_all.numel(), generator=g, device=device)]
+    if use_earlystop:
+        n_val = max(1, int(val_frac * perm_all.numel()))
+        val_idx = perm_all[:n_val]
+        tr_idx = perm_all[n_val:]
+    else:
+        val_idx = perm_all[:0]
+        tr_idx = perm_all
+    te_idx = torch.nonzero(test_mask, as_tuple=False).squeeze(-1)
+
+    mean, std = _pair_feature_stats(reps, pair_i, pair_j, tr_idx_all, minibatch)
+    feat_dim = reps.shape[1] * 2
+    W = torch.zeros(feat_dim, n_classes, device=device, requires_grad=True)
+    b = torch.zeros(n_classes, device=device, requires_grad=True)
+    opt = torch.optim.AdamW([W, b], lr=lr, weight_decay=weight_decay)
+
+    best_val = float("inf")
+    best_W = W.detach().clone()
+    best_b = b.detach().clone()
+    bad = 0
+
+    Ntr = tr_idx.shape[0]
+    for _ in range(epochs):
+        perm = torch.randperm(Ntr, device=device)
+        for s in range(0, Ntr, minibatch):
+            batch_sel = tr_idx.index_select(0, perm[s:s + minibatch])
+            xb = _pair_feature_batch(reps, pair_i, pair_j, batch_sel).to(torch.float32)
+            xb = (xb - mean) / std
+            yb = y.index_select(0, batch_sel)
+            logits = xb @ W + b
+            loss = F.cross_entropy(logits, yb, weight=class_weight)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        with torch.no_grad():
+            eval_idx = val_idx if use_earlystop else tr_idx
+            val_loss = _classification_loss_from_pair_source(
+                reps, pair_i, pair_j, eval_idx, y,
+                W.detach(), b.detach(), mean, std, class_weight, minibatch,
+            )
+        if val_loss < best_val:
+            best_val = val_loss
+            best_W = W.detach().clone()
+            best_b = b.detach().clone()
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+
+    return _eval_pair_probe_streaming(
+        reps, pair_i, pair_j, te_idx, y, best_W, best_b, mean, std,
+        n_classes, minibatch,
+    )
+
+
 # =============================================================================
 # Layer-wise aggregation and divergence
 # =============================================================================
@@ -1164,15 +1341,13 @@ def run_probing_pipeline(model_path, tokenizer_path, scrambled_sentences,
         for lh in tqdm(range(L * H), desc="pairwise", unit="head"):
             l, h = divmod(lh, H)
             reps_lh = pt.reps[l, h]              # (N, d_head)
-            X_pair = pairwise_features_for_head(reps_lh, pair_i, pair_j)
-
-            arc_res = train_single_probe(
-                X_pair, y_arc, train_pair, test_pair,
+            arc_res = train_single_probe_pair_source(
+                reps_lh, pair_i, pair_j, y_arc, train_pair, test_pair,
                 n_classes=2, epochs=pairwise_epochs,
                 class_weight=cw,
             )
-            arc_rand_label = train_single_probe(
-                X_pair, y_arc_shuf, train_pair, test_pair,
+            arc_rand_label = train_single_probe_pair_source(
+                reps_lh, pair_i, pair_j, y_arc_shuf, train_pair, test_pair,
                 n_classes=2, epochs=pairwise_epochs,
                 class_weight=cw, seed=lh + 101,
             )
@@ -1183,12 +1358,13 @@ def run_probing_pipeline(model_path, tokenizer_path, scrambled_sentences,
                 train_pair_pos.sum().item() >= 20
             ):
                 # Relation probe on positive pairs only
-                rel_res = train_single_probe(
-                    X_pair, y_rel, train_pair_pos, test_pair_pos,
+                rel_res = train_single_probe_pair_source(
+                    reps_lh, pair_i, pair_j, y_rel, train_pair_pos, test_pair_pos,
                     n_classes=n_rel, epochs=pairwise_epochs,
                 )
-                rel_rand_label = train_single_probe(
-                    X_pair, y_rel_shuf, train_pair_pos, test_pair_pos,
+                rel_rand_label = train_single_probe_pair_source(
+                    reps_lh, pair_i, pair_j, y_rel_shuf,
+                    train_pair_pos, test_pair_pos,
                     n_classes=n_rel, epochs=pairwise_epochs,
                     seed=lh + 313,
                 )
@@ -1227,14 +1403,13 @@ def run_probing_pipeline(model_path, tokenizer_path, scrambled_sentences,
 
         # Pairwise word-embedding and distance baselines
         print("  Pairwise baselines (word-emb + distance)...", flush=True)
-        X_pair_wte = pairwise_features_for_head(pt.wte, pair_i, pair_j)
-        pw_wte_arc = train_single_probe(
-            X_pair_wte, y_arc, train_pair, test_pair,
+        pw_wte_arc = train_single_probe_pair_source(
+            pt.wte, pair_i, pair_j, y_arc, train_pair, test_pair,
             n_classes=2, epochs=pairwise_epochs, class_weight=cw,
         )
         pw_wte_rel = None
-        pw_rand_arc = train_single_probe(
-            X_pair_wte, y_arc_shuf, train_pair, test_pair,
+        pw_rand_arc = train_single_probe_pair_source(
+            pt.wte, pair_i, pair_j, y_arc_shuf, train_pair, test_pair,
             n_classes=2, epochs=pairwise_epochs, class_weight=cw, seed=401,
         )
         pw_rand_rel = None
@@ -1243,12 +1418,13 @@ def run_probing_pipeline(model_path, tokenizer_path, scrambled_sentences,
             test_pair_pos.sum().item() >= 20 and
             train_pair_pos.sum().item() >= 20
         ):
-            pw_wte_rel = train_single_probe(
-                X_pair_wte, y_rel, train_pair_pos, test_pair_pos,
+            pw_wte_rel = train_single_probe_pair_source(
+                pt.wte, pair_i, pair_j, y_rel, train_pair_pos, test_pair_pos,
                 n_classes=n_rel, epochs=pairwise_epochs,
             )
-            pw_rand_rel = train_single_probe(
-                X_pair_wte, y_rel_shuf, train_pair_pos, test_pair_pos,
+            pw_rand_rel = train_single_probe_pair_source(
+                pt.wte, pair_i, pair_j, y_rel_shuf,
+                train_pair_pos, test_pair_pos,
                 n_classes=n_rel, epochs=pairwise_epochs, seed=409,
             )
         dist_feat = distance.unsqueeze(-1)
